@@ -3298,9 +3298,7 @@ class RedisClient {
         local member = ARGV[1]
         local now = tonumber(ARGV[2])
 
-        if member then
-          redis.call('ZREM', key, member)
-        end
+        redis.call('ZREM', key, member)
 
         redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 
