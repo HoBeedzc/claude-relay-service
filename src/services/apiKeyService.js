@@ -358,6 +358,171 @@ class ApiKeyService {
     }
   }
 
+  // 🧩 解析 API Key 的限制模型/客户端/标签及 OpenAI Responses 规则字段（校验流程共用）
+  _parseKeyRuleFields(keyData) {
+    let restrictedModels = []
+    try {
+      restrictedModels = keyData.restrictedModels ? JSON.parse(keyData.restrictedModels) : []
+    } catch (e) {
+      restrictedModels = []
+    }
+
+    let allowedClients = []
+    try {
+      allowedClients = keyData.allowedClients ? JSON.parse(keyData.allowedClients) : []
+    } catch (e) {
+      allowedClients = []
+    }
+
+    let tags = []
+    try {
+      tags = keyData.tags ? JSON.parse(keyData.tags) : []
+    } catch (e) {
+      tags = []
+    }
+
+    return {
+      restrictedModels,
+      allowedClients,
+      tags,
+      openaiResponsesPayloadRules: parseOpenAIResponsesPayloadRules(
+        keyData.openaiResponsesPayloadRules
+      ),
+      enableOpenAIResponsesCodexAdaptation: parseBooleanWithDefault(
+        keyData.enableOpenAIResponsesCodexAdaptation,
+        true
+      ),
+      enableOpenAIResponsesPayloadRules: parseBooleanWithDefault(
+        keyData.enableOpenAIResponsesPayloadRules,
+        false
+      )
+    }
+  }
+
+  // 🧩 组装校验结果 keyData 中的公共字段
+  _buildKeyDataCommonFields(keyData) {
+    return {
+      id: keyData.id,
+      name: keyData.name,
+      description: keyData.description,
+      createdAt: keyData.createdAt,
+      expiresAt: keyData.expiresAt,
+      claudeAccountId: keyData.claudeAccountId,
+      claudeConsoleAccountId: keyData.claudeConsoleAccountId,
+      geminiAccountId: keyData.geminiAccountId,
+      openaiAccountId: keyData.openaiAccountId,
+      azureOpenaiAccountId: keyData.azureOpenaiAccountId,
+      bedrockAccountId: keyData.bedrockAccountId, // 添加 Bedrock 账号ID
+      droidAccountId: keyData.droidAccountId,
+      permissions: normalizePermissions(keyData.permissions),
+      tokenLimit: parseInt(keyData.tokenLimit),
+      concurrencyLimit: parseInt(keyData.concurrencyLimit || 0),
+      rateLimitWindow: parseInt(keyData.rateLimitWindow || 0),
+      rateLimitRequests: parseInt(keyData.rateLimitRequests || 0),
+      rateLimitCost: parseFloat(keyData.rateLimitCost || 0), // 新增：速率限制费用字段
+      enableModelRestriction: keyData.enableModelRestriction === 'true',
+      enableClientRestriction: keyData.enableClientRestriction === 'true'
+    }
+  }
+
+  // 🧩 根据窗口开始时间计算并写入速率限制窗口状态
+  _applyWindowState(key, windowStart) {
+    if (windowStart) {
+      const now = Date.now()
+      const windowStartTime = parseInt(windowStart)
+      const windowDuration = key.rateLimitWindow * 60 * 1000 // 转换为毫秒
+      const windowEndTime = windowStartTime + windowDuration
+
+      // 如果窗口还有效
+      if (now < windowEndTime) {
+        key.windowStartTime = windowStartTime
+        key.windowEndTime = windowEndTime
+        key.windowRemainingSeconds = Math.max(0, Math.floor((windowEndTime - now) / 1000))
+      } else {
+        // 窗口已过期，下次请求会重置
+        key.windowStartTime = null
+        key.windowEndTime = null
+        key.windowRemainingSeconds = 0
+        // 重置计数为0，因为窗口已过期
+        key.currentWindowRequests = 0
+        key.currentWindowTokens = 0
+        key.currentWindowCost = 0
+      }
+    } else {
+      // 窗口还未开始（没有任何请求）
+      key.windowStartTime = null
+      key.windowEndTime = null
+      key.windowRemainingSeconds = null
+    }
+  }
+
+  // 🧩 未启用速率限制窗口时的默认窗口状态
+  _resetWindowState(key) {
+    key.currentWindowRequests = 0
+    key.currentWindowTokens = 0
+    key.currentWindowCost = 0
+    key.windowStartTime = null
+    key.windowEndTime = null
+    key.windowRemainingSeconds = null
+  }
+
+  // 🧩 更新 Key 最后使用时间并记录账户级使用统计（recordUsage 与 recordUsageWithDetails 共用），返回 keyData
+  async _updateLastUsedAndAccountUsage(keyId, accountId, totalTokens, accountUsageArgs) {
+    const keyData = await redis.getApiKey(keyId)
+    if (keyData && Object.keys(keyData).length > 0) {
+      // 更新最后使用时间
+      const lastUsedAt = new Date().toISOString()
+      keyData.lastUsedAt = lastUsedAt
+      await redis.setApiKey(keyId, keyData)
+
+      // 同步更新 lastUsedAt 索引
+      try {
+        const apiKeyIndexService = require('./apiKeyIndexService')
+        await apiKeyIndexService.updateLastUsedAt(keyId, lastUsedAt)
+      } catch (err) {
+        // 索引更新失败不影响主流程
+      }
+
+      // 记录账户级别的使用统计（只统计实际处理请求的账户）
+      if (accountId) {
+        await redis.incrementAccountUsage(accountId, ...accountUsageArgs)
+        logger.database(
+          `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
+        )
+      } else {
+        logger.debug(
+          '⚠️ No accountId provided for usage recording, skipping account-level statistics'
+        )
+      }
+    }
+    return keyData
+  }
+
+  // 🧩 组装使用详情记录的公共字段
+  _buildUsageRecordBase(lifecycleRecordId, accountId, accountType, finalizedRequestMeta) {
+    const recordTimestamp = new Date().toISOString()
+    return {
+      timestamp: recordTimestamp,
+      completedAt: recordTimestamp,
+      updatedAt: recordTimestamp,
+      lifecycleRecordId,
+      requestLifecycleId: lifecycleRecordId,
+      accountId: accountId || null,
+      accountType: accountType || null,
+      requestId: finalizedRequestMeta?.requestId || null,
+      endpoint: finalizedRequestMeta?.endpoint || null,
+      method: finalizedRequestMeta?.method || null,
+      statusCode: finalizedRequestMeta?.statusCode || null,
+      stream: finalizedRequestMeta?.stream === true,
+      durationMs: finalizedRequestMeta?.durationMs ?? null,
+      usageStatus: 'completed',
+      lifecycleStatus: 'completed',
+      usageMissing: false,
+      billableUsageUnknown: false,
+      isUsageFinal: true
+    }
+  }
+
   // 🔍 验证API Key
   async validateApiKey(apiKey, options = {}) {
     try {
@@ -483,29 +648,15 @@ class ApiKeyService {
 
       logger.api(`🔓 API key validated successfully: ${keyData.id}`)
 
-      // 解析限制模型数据
-      let restrictedModels = []
-      try {
-        restrictedModels = keyData.restrictedModels ? JSON.parse(keyData.restrictedModels) : []
-      } catch (e) {
-        restrictedModels = []
-      }
-
-      // 解析允许的客户端
-      let allowedClients = []
-      try {
-        allowedClients = keyData.allowedClients ? JSON.parse(keyData.allowedClients) : []
-      } catch (e) {
-        allowedClients = []
-      }
-
-      // 解析标签
-      let tags = []
-      try {
-        tags = keyData.tags ? JSON.parse(keyData.tags) : []
-      } catch (e) {
-        tags = []
-      }
+      // 解析限制模型/客户端/标签及 OpenAI Responses 规则字段
+      const {
+        restrictedModels,
+        allowedClients,
+        tags,
+        openaiResponsesPayloadRules,
+        enableOpenAIResponsesCodexAdaptation,
+        enableOpenAIResponsesPayloadRules
+      } = this._parseKeyRuleFields(keyData)
 
       // 解析 serviceRates
       let serviceRates = {}
@@ -515,42 +666,11 @@ class ApiKeyService {
         // 解析失败使用默认值
       }
 
-      const openaiResponsesPayloadRules = parseOpenAIResponsesPayloadRules(
-        keyData.openaiResponsesPayloadRules
-      )
-      const enableOpenAIResponsesCodexAdaptation = parseBooleanWithDefault(
-        keyData.enableOpenAIResponsesCodexAdaptation,
-        true
-      )
-      const enableOpenAIResponsesPayloadRules = parseBooleanWithDefault(
-        keyData.enableOpenAIResponsesPayloadRules,
-        false
-      )
-
       return {
         valid: true,
         keyData: {
-          id: keyData.id,
-          name: keyData.name,
-          description: keyData.description,
-          createdAt: keyData.createdAt,
-          expiresAt: keyData.expiresAt,
-          claudeAccountId: keyData.claudeAccountId,
-          claudeConsoleAccountId: keyData.claudeConsoleAccountId,
-          geminiAccountId: keyData.geminiAccountId,
-          openaiAccountId: keyData.openaiAccountId,
-          azureOpenaiAccountId: keyData.azureOpenaiAccountId,
-          bedrockAccountId: keyData.bedrockAccountId, // 添加 Bedrock 账号ID
-          droidAccountId: keyData.droidAccountId,
-          permissions: normalizePermissions(keyData.permissions),
-          tokenLimit: parseInt(keyData.tokenLimit),
-          concurrencyLimit: parseInt(keyData.concurrencyLimit || 0),
-          rateLimitWindow: parseInt(keyData.rateLimitWindow || 0),
-          rateLimitRequests: parseInt(keyData.rateLimitRequests || 0),
-          rateLimitCost: parseFloat(keyData.rateLimitCost || 0), // 新增：速率限制费用字段
-          enableModelRestriction: keyData.enableModelRestriction === 'true',
+          ...this._buildKeyDataCommonFields(keyData),
           restrictedModels,
-          enableClientRestriction: keyData.enableClientRestriction === 'true',
           allowedClients,
           dailyCostLimit,
           totalCostLimit,
@@ -642,50 +762,20 @@ class ApiKeyService {
       // 获取使用统计
       const usage = await redis.getUsageStats(keyData.id)
 
-      // 解析限制模型数据
-      let restrictedModels = []
-      try {
-        restrictedModels = keyData.restrictedModels ? JSON.parse(keyData.restrictedModels) : []
-      } catch (e) {
-        restrictedModels = []
-      }
-
-      // 解析允许的客户端
-      let allowedClients = []
-      try {
-        allowedClients = keyData.allowedClients ? JSON.parse(keyData.allowedClients) : []
-      } catch (e) {
-        allowedClients = []
-      }
-
-      // 解析标签
-      let tags = []
-      try {
-        tags = keyData.tags ? JSON.parse(keyData.tags) : []
-      } catch (e) {
-        tags = []
-      }
-
-      const openaiResponsesPayloadRules = parseOpenAIResponsesPayloadRules(
-        keyData.openaiResponsesPayloadRules
-      )
-      const enableOpenAIResponsesCodexAdaptation = parseBooleanWithDefault(
-        keyData.enableOpenAIResponsesCodexAdaptation,
-        true
-      )
-      const enableOpenAIResponsesPayloadRules = parseBooleanWithDefault(
-        keyData.enableOpenAIResponsesPayloadRules,
-        false
-      )
+      // 解析限制模型/客户端/标签及 OpenAI Responses 规则字段
+      const {
+        restrictedModels,
+        allowedClients,
+        tags,
+        openaiResponsesPayloadRules,
+        enableOpenAIResponsesCodexAdaptation,
+        enableOpenAIResponsesPayloadRules
+      } = this._parseKeyRuleFields(keyData)
 
       return {
         valid: true,
         keyData: {
-          id: keyData.id,
-          name: keyData.name,
-          description: keyData.description,
-          createdAt: keyData.createdAt,
-          expiresAt: keyData.expiresAt,
+          ...this._buildKeyDataCommonFields(keyData),
           // 添加激活相关字段
           expirationMode: keyData.expirationMode || 'fixed',
           isActivated: keyData.isActivated === 'true',
@@ -693,22 +783,7 @@ class ApiKeyService {
           activationUnit: keyData.activationUnit || 'days',
           activatedAt: keyData.activatedAt || null,
           scheduledActivationAt: keyData.scheduledActivationAt || null,
-          claudeAccountId: keyData.claudeAccountId,
-          claudeConsoleAccountId: keyData.claudeConsoleAccountId,
-          geminiAccountId: keyData.geminiAccountId,
-          openaiAccountId: keyData.openaiAccountId,
-          azureOpenaiAccountId: keyData.azureOpenaiAccountId,
-          bedrockAccountId: keyData.bedrockAccountId,
-          droidAccountId: keyData.droidAccountId,
-          permissions: normalizePermissions(keyData.permissions),
-          tokenLimit: parseInt(keyData.tokenLimit),
-          concurrencyLimit: parseInt(keyData.concurrencyLimit || 0),
-          rateLimitWindow: parseInt(keyData.rateLimitWindow || 0),
-          rateLimitRequests: parseInt(keyData.rateLimitRequests || 0),
-          rateLimitCost: parseFloat(keyData.rateLimitCost || 0),
-          enableModelRestriction: keyData.enableModelRestriction === 'true',
           restrictedModels,
-          enableClientRestriction: keyData.enableClientRestriction === 'true',
           allowedClients,
           dailyCostLimit: parseFloat(keyData.dailyCostLimit || 0),
           totalCostLimit: parseFloat(keyData.totalCostLimit || 0),
@@ -961,42 +1036,11 @@ class ApiKeyService {
           key.currentWindowTokens = parseInt((await client.get(tokenCountKey)) || '0')
           key.currentWindowCost = parseFloat((await client.get(costCountKey)) || '0') // 新增：当前窗口费用
 
-          // 获取窗口开始时间和计算剩余时间
+          // 获取窗口开始时间并计算窗口状态
           const windowStart = await client.get(windowStartKey)
-          if (windowStart) {
-            const now = Date.now()
-            const windowStartTime = parseInt(windowStart)
-            const windowDuration = key.rateLimitWindow * 60 * 1000 // 转换为毫秒
-            const windowEndTime = windowStartTime + windowDuration
-
-            // 如果窗口还有效
-            if (now < windowEndTime) {
-              key.windowStartTime = windowStartTime
-              key.windowEndTime = windowEndTime
-              key.windowRemainingSeconds = Math.max(0, Math.floor((windowEndTime - now) / 1000))
-            } else {
-              // 窗口已过期，下次请求会重置
-              key.windowStartTime = null
-              key.windowEndTime = null
-              key.windowRemainingSeconds = 0
-              // 重置计数为0，因为窗口已过期
-              key.currentWindowRequests = 0
-              key.currentWindowTokens = 0
-              key.currentWindowCost = 0 // 新增：重置费用
-            }
-          } else {
-            // 窗口还未开始（没有任何请求）
-            key.windowStartTime = null
-            key.windowEndTime = null
-            key.windowRemainingSeconds = null
-          }
+          this._applyWindowState(key, windowStart)
         } else {
-          key.currentWindowRequests = 0
-          key.currentWindowTokens = 0
-          key.currentWindowCost = 0 // 新增：重置费用
-          key.windowStartTime = null
-          key.windowEndTime = null
-          key.windowRemainingSeconds = null
+          this._resetWindowState(key)
         }
 
         try {
@@ -1210,36 +1254,9 @@ class ApiKeyService {
           key.currentWindowRequests = rl.requests || 0
           key.currentWindowTokens = rl.tokens || 0
           key.currentWindowCost = rl.cost || 0
-
-          if (rl.windowStart) {
-            const now = Date.now()
-            const windowDuration = key.rateLimitWindow * 60 * 1000
-            const windowEndTime = rl.windowStart + windowDuration
-
-            if (now < windowEndTime) {
-              key.windowStartTime = rl.windowStart
-              key.windowEndTime = windowEndTime
-              key.windowRemainingSeconds = Math.max(0, Math.floor((windowEndTime - now) / 1000))
-            } else {
-              key.windowStartTime = null
-              key.windowEndTime = null
-              key.windowRemainingSeconds = 0
-              key.currentWindowRequests = 0
-              key.currentWindowTokens = 0
-              key.currentWindowCost = 0
-            }
-          } else {
-            key.windowStartTime = null
-            key.windowEndTime = null
-            key.windowRemainingSeconds = null
-          }
+          this._applyWindowState(key, rl.windowStart)
         } else {
-          key.currentWindowRequests = 0
-          key.currentWindowTokens = 0
-          key.currentWindowCost = 0
-          key.windowStartTime = null
-          key.windowEndTime = null
-          key.windowRemainingSeconds = null
+          this._resetWindowState(key)
         }
 
         // JSON 字段解析（兼容已解析的数组和未解析的字符串）
@@ -1932,63 +1949,28 @@ class ApiKeyService {
         logger.debug(`💰 No cost recorded for ${keyId} - zero cost for model: ${model}`)
       }
 
-      // 获取API Key数据以确定关联的账户
-      const keyData = await redis.getApiKey(keyId)
-      if (keyData && Object.keys(keyData).length > 0) {
-        // 更新最后使用时间
-        const lastUsedAt = new Date().toISOString()
-        keyData.lastUsedAt = lastUsedAt
-        await redis.setApiKey(keyId, keyData)
-
-        // 同步更新 lastUsedAt 索引
-        try {
-          const apiKeyIndexService = require('./apiKeyIndexService')
-          await apiKeyIndexService.updateLastUsedAt(keyId, lastUsedAt)
-        } catch (err) {
-          // 索引更新失败不影响主流程
-        }
-
-        // 记录账户级别的使用统计（只统计实际处理请求的账户）
-        if (accountId) {
-          await redis.incrementAccountUsage(
-            accountId,
-            totalTokens,
-            inputTokens,
-            outputTokens,
-            cacheCreateTokens,
-            cacheReadTokens,
-            0, // ephemeral5mTokens - recordUsage 不含详细缓存数据
-            0, // ephemeral1hTokens - recordUsage 不含详细缓存数据
-            model,
-            isLongContextRequest
-          )
-          logger.database(
-            `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
-          )
-        } else {
-          logger.debug(
-            '⚠️ No accountId provided for usage recording, skipping account-level statistics'
-          )
-        }
-      }
+      // 获取API Key数据以确定关联的账户，更新最后使用时间并记录账户级统计
+      await this._updateLastUsedAndAccountUsage(keyId, accountId, totalTokens, [
+        totalTokens,
+        inputTokens,
+        outputTokens,
+        cacheCreateTokens,
+        cacheReadTokens,
+        0, // ephemeral5mTokens - recordUsage 不含详细缓存数据
+        0, // ephemeral1hTokens - recordUsage 不含详细缓存数据
+        model,
+        isLongContextRequest
+      ])
 
       // 记录单次请求的使用详情（同时保存真实成本和倍率成本）
-      const recordTimestamp = new Date().toISOString()
       const usageRecord = {
-        timestamp: recordTimestamp,
-        completedAt: recordTimestamp,
-        updatedAt: recordTimestamp,
-        lifecycleRecordId,
-        requestLifecycleId: lifecycleRecordId,
+        ...this._buildUsageRecordBase(
+          lifecycleRecordId,
+          accountId,
+          accountType,
+          finalizedRequestMeta
+        ),
         model,
-        accountId: accountId || null,
-        accountType: accountType || null,
-        requestId: finalizedRequestMeta?.requestId || null,
-        endpoint: finalizedRequestMeta?.endpoint || null,
-        method: finalizedRequestMeta?.method || null,
-        statusCode: finalizedRequestMeta?.statusCode || null,
-        stream: finalizedRequestMeta?.stream === true,
-        durationMs: finalizedRequestMeta?.durationMs ?? null,
         inputTokens,
         outputTokens,
         cacheCreateTokens,
@@ -1999,12 +1981,7 @@ class ApiKeyService {
         costBreakdown: costInfo?.costs || undefined,
         realCostBreakdown: costInfo?.costs || undefined,
         pricingTier: costInfo?.pricingTier || null,
-        isLongContext: isLongContextRequest,
-        usageStatus: 'completed',
-        lifecycleStatus: 'completed',
-        usageMissing: false,
-        billableUsageUnknown: false,
-        isUsageFinal: true
+        isLongContext: isLongContextRequest
       }
 
       await this._persistUsageRecord(keyId, usageRecord, lifecycleRecordId)
@@ -2233,65 +2210,30 @@ class ApiKeyService {
         }
       }
 
-      // 获取API Key数据以确定关联的账户
-      const keyData = await redis.getApiKey(keyId)
-      if (keyData && Object.keys(keyData).length > 0) {
-        // 更新最后使用时间
-        const lastUsedAt = new Date().toISOString()
-        keyData.lastUsedAt = lastUsedAt
-        await redis.setApiKey(keyId, keyData)
+      // 获取API Key数据以确定关联的账户，更新最后使用时间并记录账户级统计
+      const keyData = await this._updateLastUsedAndAccountUsage(keyId, accountId, totalTokens, [
+        totalTokens,
+        inputTokens,
+        outputTokens,
+        cacheCreateTokens,
+        cacheReadTokens,
+        ephemeral5mTokens,
+        ephemeral1hTokens,
+        actualModel,
+        costInfo.isLongContextRequest || false
+      ])
 
-        // 同步更新 lastUsedAt 索引
-        try {
-          const apiKeyIndexService = require('./apiKeyIndexService')
-          await apiKeyIndexService.updateLastUsedAt(keyId, lastUsedAt)
-        } catch (err) {
-          // 索引更新失败不影响主流程
-        }
-
-        // 记录账户级别的使用统计（只统计实际处理请求的账户）
-        if (accountId) {
-          await redis.incrementAccountUsage(
-            accountId,
-            totalTokens,
-            inputTokens,
-            outputTokens,
-            cacheCreateTokens,
-            cacheReadTokens,
-            ephemeral5mTokens,
-            ephemeral1hTokens,
-            actualModel,
-            costInfo.isLongContextRequest || false
-          )
-          logger.database(
-            `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
-          )
-        } else {
-          logger.debug(
-            '⚠️ No accountId provided for usage recording, skipping account-level statistics'
-          )
-        }
-      }
-
-      const recordTimestamp = new Date().toISOString()
       const usageRecord = {
-        timestamp: recordTimestamp,
-        completedAt: recordTimestamp,
-        updatedAt: recordTimestamp,
-        lifecycleRecordId,
-        requestLifecycleId: lifecycleRecordId,
+        ...this._buildUsageRecordBase(
+          lifecycleRecordId,
+          accountId,
+          accountType,
+          finalizedRequestMeta
+        ),
         model: recordModel,
         actualModel,
         requestedModel: requestedModel || null,
         displayModel: displayModel || recordModel,
-        accountId: accountId || null,
-        accountType: accountType || null,
-        requestId: finalizedRequestMeta?.requestId || null,
-        endpoint: finalizedRequestMeta?.endpoint || null,
-        method: finalizedRequestMeta?.method || null,
-        statusCode: finalizedRequestMeta?.statusCode || null,
-        stream: finalizedRequestMeta?.stream === true,
-        durationMs: finalizedRequestMeta?.durationMs ?? null,
         inputTokens,
         outputTokens,
         cacheCreateTokens,
@@ -2322,12 +2264,7 @@ class ApiKeyService {
         pricingSource: costInfo.pricingSource || null,
         usedFallbackPricing: costInfo.usedFallbackPricing === true,
         pricingTier: costInfo.pricingTier,
-        isLongContext: costInfo.isLongContextRequest || false,
-        usageStatus: 'completed',
-        lifecycleStatus: 'completed',
-        usageMissing: false,
-        billableUsageUnknown: false,
-        isUsageFinal: true
+        isLongContext: costInfo.isLongContextRequest || false
       }
 
       await this._persistUsageRecord(keyId, usageRecord, lifecycleRecordId)

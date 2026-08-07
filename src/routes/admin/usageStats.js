@@ -103,6 +103,690 @@ async function getUsageDataByIndex(indexKey, keyPattern, scanPattern) {
   return result
 }
 
+// ========== 通用辅助函数（收敛文件内重复逻辑） ==========
+
+const toInt = (value) => parseInt(value) || 0
+
+// 从 token 数据构建计费 usage 对象；如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
+function buildBillingUsage(data = {}) {
+  const usage = {
+    input_tokens: toInt(data.inputTokens),
+    output_tokens: toInt(data.outputTokens),
+    cache_creation_input_tokens: toInt(data.cacheCreateTokens),
+    cache_read_input_tokens: toInt(data.cacheReadTokens)
+  }
+  const eph5m = toInt(data.ephemeral5mTokens)
+  const eph1h = toInt(data.ephemeral1hTokens)
+  if (eph5m > 0 || eph1h > 0) {
+    usage.cache_creation = {
+      ephemeral_5m_input_tokens: eph5m,
+      ephemeral_1h_input_tokens: eph1h
+    }
+  }
+  return usage
+}
+
+// 解析小时粒度的起止时间（默认最近24小时）
+function resolveHourRange(startDate, endDate) {
+  if (startDate && endDate) {
+    return { startTime: new Date(startDate), endTime: new Date(endDate) }
+  }
+  const endTime = new Date()
+  return { startTime: new Date(endTime.getTime() - 24 * 60 * 60 * 1000), endTime }
+}
+
+// 构建小时区间元数据列表（hourKey/isoTime/label）
+function buildHourInfos(startTime, endTime) {
+  const hourInfos = []
+  const currentHour = new Date(startTime)
+  currentHour.setMinutes(0, 0, 0)
+
+  while (currentHour <= endTime) {
+    const tzCurrentHour = redis.getDateInTimezone(currentHour)
+    const dateStr = redis.getDateStringInTimezone(currentHour)
+    const hour = String(tzCurrentHour.getUTCHours()).padStart(2, '0')
+    const month = String(tzCurrentHour.getUTCMonth() + 1).padStart(2, '0')
+    const day = String(tzCurrentHour.getUTCDate()).padStart(2, '0')
+
+    hourInfos.push({
+      hourKey: `${dateStr}:${hour}`,
+      dateStr,
+      isoTime: currentHour.toISOString(),
+      label: `${month}/${day} ${hour}:00`
+    })
+
+    currentHour.setHours(currentHour.getHours() + 1)
+  }
+  return hourInfos
+}
+
+// 构建最近 N 天的日期元数据列表
+function buildDayInfos(daysCount) {
+  const today = new Date()
+  const dayInfos = []
+  for (let i = 0; i < daysCount; i++) {
+    const date = new Date(today)
+    date.setDate(date.getDate() - i)
+    dayInfos.push({ dateStr: redis.getDateStringInTimezone(date) })
+  }
+  return dayInfos
+}
+
+// 并行拉取每个时间桶的两组索引数据并合并为 Map
+async function fetchUsageAndModelMaps(infos, buildQueries) {
+  const usageDataMap = new Map()
+  const modelDataMap = new Map()
+
+  const allResults = await Promise.all(
+    infos.map(async (info) => {
+      const { usage, model } = buildQueries(info)
+      const [usageResults, modelResults] = await Promise.all([
+        getUsageDataByIndex(...usage),
+        getUsageDataByIndex(...model)
+      ])
+      return { usageResults, modelResults }
+    })
+  )
+
+  allResults.forEach(({ usageResults, modelResults }) => {
+    usageResults.forEach(({ key, data }) => usageDataMap.set(key, data))
+    modelResults.forEach(({ key, data }) => modelDataMap.set(key, data))
+  })
+  return { usageDataMap, modelDataMap }
+}
+
+// 按正则捕获组把 key 分组到 Map<mapKey, key[]>
+function groupKeysByRegex(keys, regex, buildMapKey = (match) => match[1]) {
+  const grouped = new Map()
+  for (const key of keys) {
+    const match = key.match(regex)
+    if (match) {
+      const mapKey = buildMapKey(match)
+      if (!grouped.has(mapKey)) {
+        grouped.set(mapKey, [])
+      }
+      grouped.get(mapKey).push(key)
+    }
+  }
+  return grouped
+}
+
+// 构建某天的时区日期键与展示标签
+function buildDayLabelInfo(date) {
+  const tzDate = redis.getDateInTimezone(date)
+  const dateKey = redis.getDateStringInTimezone(date)
+  const month = String(tzDate.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(tzDate.getUTCDate()).padStart(2, '0')
+  return { dateKey, label: `${month}/${day}` }
+}
+
+// 创建使用历史累计器（记录 history、总量与峰值日）
+function createUsageHistoryTracker() {
+  const state = {
+    history: [],
+    totalCost: 0,
+    totalRequests: 0,
+    totalTokens: 0,
+    highestCostDay: null,
+    highestRequestDay: null
+  }
+  return {
+    state,
+    add({ dateKey, label, cost, requests, tokens }) {
+      state.totalCost += cost
+      state.totalRequests += requests
+      state.totalTokens += tokens
+
+      if (!state.highestCostDay || cost > state.highestCostDay.cost) {
+        state.highestCostDay = {
+          date: dateKey,
+          label,
+          cost,
+          formattedCost: CostCalculator.formatCost(cost)
+        }
+      }
+      if (!state.highestRequestDay || requests > state.highestRequestDay.requests) {
+        state.highestRequestDay = { date: dateKey, label, requests }
+      }
+
+      state.history.push({
+        date: dateKey,
+        label,
+        cost,
+        formattedCost: CostCalculator.formatCost(cost),
+        requests,
+        tokens
+      })
+    }
+  }
+}
+
+// 构建使用历史 summary（日均值按创建时间截断，至少1天避免除零）
+function buildUsageHistorySummary({ daysCount, createdAt, state }) {
+  let actualDaysForAvg = daysCount
+  if (createdAt) {
+    const diffDays = Math.ceil(Math.abs(new Date() - createdAt) / (1000 * 60 * 60 * 24))
+    actualDaysForAvg = Math.max(Math.min(diffDays, daysCount), 1)
+  }
+
+  const { history, totalCost, totalRequests, totalTokens, highestCostDay, highestRequestDay } =
+    state
+  const avgDailyCost = actualDaysForAvg > 0 ? totalCost / actualDaysForAvg : 0
+  const todayData = history.length > 0 ? history[history.length - 1] : null
+
+  return {
+    days: daysCount,
+    actualDaysUsed: actualDaysForAvg,
+    totalCost,
+    totalCostFormatted: CostCalculator.formatCost(totalCost),
+    totalRequests,
+    totalTokens,
+    avgDailyCost,
+    avgDailyCostFormatted: CostCalculator.formatCost(avgDailyCost),
+    avgDailyRequests: actualDaysForAvg > 0 ? totalRequests / actualDaysForAvg : 0,
+    avgDailyTokens: actualDaysForAvg > 0 ? totalTokens / actualDaysForAvg : 0,
+    today: todayData
+      ? {
+          date: todayData.date,
+          cost: todayData.cost,
+          costFormatted: todayData.formattedCost,
+          requests: todayData.requests,
+          tokens: todayData.tokens
+        }
+      : null,
+    highestCostDay,
+    highestRequestDay
+  }
+}
+
+// 聚合单个时间桶的模型/总量数据（usage-trend 小时与天粒度共用）
+function aggregateTrendBucket({
+  modelKeys,
+  usageKeys,
+  modelDataMap,
+  usageDataMap,
+  modelKeyRegex,
+  requireUsageKeys
+}) {
+  const bucket = {
+    inputTokens: 0,
+    outputTokens: 0,
+    requests: 0,
+    cacheCreateTokens: 0,
+    cacheReadTokens: 0,
+    cost: 0
+  }
+
+  // 处理模型级别数据
+  for (const modelKey of modelKeys) {
+    const modelMatch = modelKey.match(modelKeyRegex)
+    if (!modelMatch) {
+      continue
+    }
+    const model = modelMatch[1]
+    const data = modelDataMap.get(modelKey)
+    if (!data || Object.keys(data).length === 0) {
+      continue
+    }
+
+    const usage = buildBillingUsage(data)
+    bucket.inputTokens += usage.input_tokens
+    bucket.outputTokens += usage.output_tokens
+    bucket.cacheCreateTokens += usage.cache_creation_input_tokens
+    bucket.cacheReadTokens += usage.cache_read_input_tokens
+    bucket.requests += toInt(data.requests)
+    bucket.cost += CostCalculator.calculateCost(usage, model).costs.total
+  }
+
+  // 如果没有模型级别的数据，回退到 API Key 级别的数据
+  if (modelKeys.length === 0 && (!requireUsageKeys || usageKeys.length > 0)) {
+    let eph5m = 0
+    let eph1h = 0
+    for (const key of usageKeys) {
+      const data = usageDataMap.get(key)
+      if (data) {
+        bucket.inputTokens += toInt(data.inputTokens)
+        bucket.outputTokens += toInt(data.outputTokens)
+        bucket.requests += toInt(data.requests)
+        bucket.cacheCreateTokens += toInt(data.cacheCreateTokens)
+        bucket.cacheReadTokens += toInt(data.cacheReadTokens)
+        eph5m += toInt(data.ephemeral5mTokens)
+        eph1h += toInt(data.ephemeral1hTokens)
+      }
+    }
+
+    const usage = buildBillingUsage({
+      inputTokens: bucket.inputTokens,
+      outputTokens: bucket.outputTokens,
+      cacheCreateTokens: bucket.cacheCreateTokens,
+      cacheReadTokens: bucket.cacheReadTokens,
+      ephemeral5mTokens: eph5m,
+      ephemeral1hTokens: eph1h
+    })
+    bucket.cost = CostCalculator.calculateCost(usage, 'unknown').costs.total
+  }
+
+  return bucket
+}
+
+// 将账号列表映射为趋势图使用的精简结构
+const mapTrendAccounts = (accounts, platform, buildName) =>
+  accounts.map((account) => {
+    const id = String(account.id || '')
+    const shortId = id ? id.slice(0, 8) : '未知'
+    return { id, name: buildName(account, shortId), platform }
+  })
+
+// 处理单个时间桶内各账号的用量与费用（account-usage-trend 小时与天粒度共用）
+function buildAccountBucketStats({
+  usageKeys,
+  usageDataMap,
+  modelKeysMap,
+  modelDataMap,
+  bucketKey,
+  usageKeyRegex,
+  accountIdSet,
+  accountMap,
+  fallbackModel,
+  accountCostTotals
+}) {
+  const accounts = {}
+
+  for (const key of usageKeys) {
+    const match = key.match(usageKeyRegex)
+    if (!match) {
+      continue
+    }
+
+    const accountId = match[1]
+    if (!accountIdSet.has(accountId)) {
+      continue
+    }
+
+    const data = usageDataMap.get(key)
+    if (!data) {
+      continue
+    }
+
+    const inputTokens = toInt(data.inputTokens)
+    const outputTokens = toInt(data.outputTokens)
+    const cacheCreateTokens = toInt(data.cacheCreateTokens)
+    const cacheReadTokens = toInt(data.cacheReadTokens)
+    const allTokens =
+      toInt(data.allTokens) || inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
+    const requests = toInt(data.requests)
+
+    // 计算模型费用（从预加载的数据中）
+    let cost = 0
+    const modelKeys = modelKeysMap.get(`${accountId}:${bucketKey}`) || []
+    for (const modelKey of modelKeys) {
+      const modelData = modelDataMap.get(modelKey)
+      if (!modelData) {
+        continue
+      }
+
+      const parts = modelKey.split(':')
+      if (parts.length < 5) {
+        continue
+      }
+
+      const modelName = parts[4]
+      cost += CostCalculator.calculateCost(buildBillingUsage(modelData), modelName).costs.total
+    }
+
+    if (cost === 0 && allTokens > 0) {
+      cost = CostCalculator.calculateCost(buildBillingUsage(data), fallbackModel).costs.total
+    }
+
+    const accountInfo = accountMap.get(accountId)
+    accounts[accountId] = {
+      name: accountInfo ? accountInfo.name : `账号 ${accountId.slice(0, 8)}`,
+      cost,
+      formattedCost: CostCalculator.formatCost(cost),
+      requests
+    }
+
+    accountCostTotals.set(accountId, (accountCostTotals.get(accountId) || 0) + cost)
+  }
+
+  return accounts
+}
+
+// 处理单个时间桶内各 API Key 的用量与费用（api-keys-usage-trend 小时与天粒度共用）
+function buildApiKeyBucketStats({
+  usageKeys,
+  modelKeys,
+  usageDataMap,
+  modelDataMap,
+  usageKeyRegex,
+  modelKeyRegex,
+  apiKeyMap
+}) {
+  // 处理 usage 数据
+  const apiKeyDataMap = new Map()
+  for (const key of usageKeys) {
+    const match = key.match(usageKeyRegex)
+    if (!match) {
+      continue
+    }
+
+    const apiKeyId = match[1]
+    const data = usageDataMap.get(key)
+    if (!data || !apiKeyMap.has(apiKeyId)) {
+      continue
+    }
+
+    const inputTokens = toInt(data.inputTokens)
+    const outputTokens = toInt(data.outputTokens)
+    const cacheCreateTokens = toInt(data.cacheCreateTokens)
+    const cacheReadTokens = toInt(data.cacheReadTokens)
+
+    apiKeyDataMap.set(apiKeyId, {
+      name: apiKeyMap.get(apiKeyId).name,
+      tokens: inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens,
+      requests: toInt(data.requests),
+      inputTokens,
+      outputTokens,
+      cacheCreateTokens,
+      cacheReadTokens,
+      ephemeral5mTokens: toInt(data.ephemeral5mTokens),
+      ephemeral1hTokens: toInt(data.ephemeral1hTokens)
+    })
+  }
+
+  // 处理 model 数据计算费用
+  const apiKeyCostMap = new Map()
+  for (const modelKey of modelKeys) {
+    const match = modelKey.match(modelKeyRegex)
+    if (!match) {
+      continue
+    }
+
+    const apiKeyId = match[1]
+    const model = match[2]
+    const modelData = modelDataMap.get(modelKey)
+    if (!modelData || !apiKeyDataMap.has(apiKeyId)) {
+      continue
+    }
+
+    // 优先使用已存储的费用
+    const hasStoredCost = 'realCostMicro' in modelData || 'ratedCostMicro' in modelData
+    let modelCost = 0
+
+    if (hasStoredCost) {
+      modelCost = toInt(modelData.ratedCostMicro) / 1000000
+    } else {
+      // Legacy fallback：旧数据没有存储费用，从 token 重算
+      modelCost = CostCalculator.calculateCost(buildBillingUsage(modelData), model).costs.total
+    }
+
+    apiKeyCostMap.set(apiKeyId, (apiKeyCostMap.get(apiKeyId) || 0) + modelCost)
+  }
+
+  // 组合数据
+  const bucketApiKeys = {}
+  for (const [apiKeyId, data] of apiKeyDataMap) {
+    let cost = apiKeyCostMap.get(apiKeyId) || 0
+    let formattedCost = CostCalculator.formatCost(cost)
+
+    // 降级方案
+    if (cost === 0 && data.tokens > 0) {
+      const fallbackResult = CostCalculator.calculateCost(
+        buildBillingUsage(data),
+        'claude-3-5-sonnet-20241022'
+      )
+      cost = fallbackResult.costs.total
+      formattedCost = fallbackResult.formatted.total
+    }
+
+    bucketApiKeys[apiKeyId] = {
+      name: data.name,
+      tokens: data.tokens,
+      requests: data.requests,
+      cost,
+      formattedCost
+    }
+  }
+
+  return bucketApiKeys
+}
+
+// 累加模型统计（model-stats 自定义与预设期间共用）
+function accumulateModelStats(modelStatsMap, model, data) {
+  if (!modelStatsMap.has(model)) {
+    modelStatsMap.set(model, {
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreateTokens: 0,
+      cacheReadTokens: 0,
+      ephemeral5mTokens: 0,
+      ephemeral1hTokens: 0,
+      allTokens: 0,
+      realCostMicro: 0,
+      ratedCostMicro: 0,
+      hasStoredCost: false
+    })
+  }
+  const stats = modelStatsMap.get(model)
+  stats.requests += toInt(data.requests)
+  stats.inputTokens += toInt(data.inputTokens)
+  stats.outputTokens += toInt(data.outputTokens)
+  stats.cacheCreateTokens += toInt(data.cacheCreateTokens)
+  stats.cacheReadTokens += toInt(data.cacheReadTokens)
+  stats.ephemeral5mTokens += toInt(data.ephemeral5mTokens)
+  stats.ephemeral1hTokens += toInt(data.ephemeral1hTokens)
+  stats.allTokens += toInt(data.allTokens)
+  if ('realCostMicro' in data || 'ratedCostMicro' in data) {
+    stats.realCostMicro += toInt(data.realCostMicro)
+    stats.ratedCostMicro += toInt(data.ratedCostMicro)
+    stats.hasStoredCost = true
+  }
+}
+
+// 累加模型 token 用量（usage-costs 共用）
+function accumulateModelUsage(modelUsageMap, model, data) {
+  if (!modelUsageMap.has(model)) {
+    modelUsageMap.set(model, {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreateTokens: 0,
+      cacheReadTokens: 0,
+      ephemeral5mTokens: 0,
+      ephemeral1hTokens: 0
+    })
+  }
+  const modelUsage = modelUsageMap.get(model)
+  modelUsage.inputTokens += toInt(data.inputTokens)
+  modelUsage.outputTokens += toInt(data.outputTokens)
+  modelUsage.cacheCreateTokens += toInt(data.cacheCreateTokens)
+  modelUsage.cacheReadTokens += toInt(data.cacheReadTokens)
+  modelUsage.ephemeral5mTokens += toInt(data.ephemeral5mTokens)
+  modelUsage.ephemeral1hTokens += toInt(data.ephemeral1hTokens)
+}
+
+// 累加单模型费用到 totalCosts
+function addCostResult(totalCosts, costResult) {
+  totalCosts.inputCost += costResult.costs.input
+  totalCosts.outputCost += costResult.costs.output
+  totalCosts.cacheCreateCost += costResult.costs.cacheWrite
+  totalCosts.cacheReadCost += costResult.costs.cacheRead
+  totalCosts.totalCost += costResult.costs.total
+}
+
+// 格式化 totalCosts 响应结构
+function formatTotalCosts(totalCosts) {
+  return {
+    ...totalCosts,
+    formatted: {
+      inputCost: CostCalculator.formatCost(totalCosts.inputCost),
+      outputCost: CostCalculator.formatCost(totalCosts.outputCost),
+      cacheCreateCost: CostCalculator.formatCost(totalCosts.cacheCreateCost),
+      cacheReadCost: CostCalculator.formatCost(totalCosts.cacheReadCost),
+      totalCost: CostCalculator.formatCost(totalCosts.totalCost)
+    }
+  }
+}
+
+// 汇总 modelUsageMap 到 totalCosts 与 modelCosts（7天/全部期间共用）
+function summarizeModelUsageCosts(modelUsageMap, totalCosts, modelCosts, logSuffix = '') {
+  for (const [model, usage] of modelUsageMap) {
+    const usageData = buildBillingUsage(usage)
+    const costResult = CostCalculator.calculateCost(usageData, model)
+    addCostResult(totalCosts, costResult)
+
+    logger.info(
+      `💰 Model ${model}${logSuffix}: ${
+        usage.inputTokens + usage.outputTokens + usage.cacheCreateTokens + usage.cacheReadTokens
+      } tokens, cost: ${costResult.formatted.total}`
+    )
+
+    // 记录模型费用（汇总数据没有请求数统计）
+    modelCosts[model] = {
+      model,
+      requests: 0,
+      usage: usageData,
+      costs: costResult.costs,
+      formatted: costResult.formatted,
+      usingDynamicPricing: costResult.usingDynamicPricing
+    }
+  }
+}
+
+// 将请求记录转换为计费 usage 对象（usage-records 共用）
+const recordToUsageObject = (record) => {
+  const usage = {
+    input_tokens: record.inputTokens || 0,
+    output_tokens: record.outputTokens || 0,
+    cache_creation_input_tokens: record.cacheCreateTokens || 0,
+    cache_read_input_tokens: record.cacheReadTokens || 0,
+    cache_creation: record.cacheCreation || record.cache_creation || null
+  }
+  // 如果没有 cache_creation 但有独立存储的 ephemeral 字段，构建子对象
+  if (!usage.cache_creation) {
+    const eph5m = toInt(record.ephemeral5mTokens)
+    const eph1h = toInt(record.ephemeral1hTokens)
+    if (eph5m > 0 || eph1h > 0) {
+      usage.cache_creation = {
+        ephemeral_5m_input_tokens: eph5m,
+        ephemeral_1h_input_tokens: eph1h
+      }
+    }
+  }
+  return usage
+}
+
+// 解析请求记录查询公共参数（分页/排序/时间范围）
+function parseRecordQuery(query) {
+  const pageNumber = Math.max(parseInt(query.page, 10) || 1, 1)
+  const pageSizeNumber = Math.min(Math.max(parseInt(query.pageSize, 10) || 50, 1), 200)
+  const normalizedSortOrder = query.sortOrder === 'asc' ? 'asc' : 'desc'
+  const startTime = query.startDate ? new Date(query.startDate) : null
+  const endTime = query.endDate ? new Date(query.endDate) : null
+  const invalidRange =
+    (query.startDate && Number.isNaN(startTime?.getTime())) ||
+    (query.endDate && Number.isNaN(endTime?.getTime()))
+  return { pageNumber, pageSizeNumber, normalizedSortOrder, startTime, endTime, invalidRange }
+}
+
+// 判断记录时间是否在范围内
+const isRecordWithinRange = (record, startTime, endTime) => {
+  if (!record.timestamp) {
+    return false
+  }
+  const ts = new Date(record.timestamp)
+  if (Number.isNaN(ts.getTime())) {
+    return false
+  }
+  if (startTime && ts < startTime) {
+    return false
+  }
+  if (endTime && ts > endTime) {
+    return false
+  }
+  return true
+}
+
+// 按时间排序请求记录（原地排序）
+function sortRecordsByTimestamp(records, order) {
+  records.sort((a, b) => {
+    const aTime = new Date(a.timestamp).getTime()
+    const bTime = new Date(b.timestamp).getTime()
+    if (Number.isNaN(aTime) || Number.isNaN(bTime)) {
+      return 0
+    }
+    return order === 'asc' ? aTime - bTime : bTime - aTime
+  })
+}
+
+// 请求记录分页切片
+function paginateRecords(records, pageNumber, pageSizeNumber) {
+  const totalRecords = records.length
+  const totalPages = totalRecords > 0 ? Math.ceil(totalRecords / pageSizeNumber) : 0
+  const safePage = totalPages > 0 ? Math.min(pageNumber, totalPages) : 1
+  const startIndex = (safePage - 1) * pageSizeNumber
+  const pageRecords =
+    totalRecords === 0 ? [] : records.slice(startIndex, startIndex + pageSizeNumber)
+  return {
+    pageRecords,
+    pagination: {
+      currentPage: safePage,
+      pageSize: pageSizeNumber,
+      totalRecords,
+      totalPages,
+      hasNextPage: totalPages > 0 && safePage < totalPages,
+      hasPreviousPage: totalPages > 0 && safePage > 1
+    }
+  }
+}
+
+// 计算单条记录的费用与 token 汇总
+function computeRecordCost(record) {
+  const usage = recordToUsageObject(record)
+  const costModel = record.actualModel || record.model || 'unknown'
+  const costData = CostCalculator.calculateCost(usage, costModel)
+  const computedCost = typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
+  const realCost =
+    typeof record.realCost === 'number' ? record.realCost : costData?.costs?.total || 0
+  const totalTokens =
+    record.totalTokens ||
+    usage.input_tokens +
+      usage.output_tokens +
+      usage.cache_creation_input_tokens +
+      usage.cache_read_input_tokens
+  return { usage, costData, computedCost, realCost, totalTokens }
+}
+
+// 累加单条记录到 summary
+function addRecordToSummary(summary, usage, totalTokens, computedCost) {
+  summary.totalRequests += 1
+  summary.inputTokens += usage.input_tokens
+  summary.outputTokens += usage.output_tokens
+  summary.cacheCreateTokens += usage.cache_creation_input_tokens
+  summary.cacheReadTokens += usage.cache_read_input_tokens
+  summary.totalTokens += totalTokens
+  summary.totalCost += computedCost
+}
+
+// 构建记录的 costBreakdown 字段
+const buildCostBreakdown = (record, costData, computedCost) =>
+  record.realCostBreakdown ||
+  record.costBreakdown || {
+    input: costData?.costs?.input || 0,
+    output: costData?.costs?.output || 0,
+    cacheCreate: costData?.costs?.cacheWrite || 0,
+    cacheRead: costData?.costs?.cacheRead || 0,
+    total: costData?.costs?.total || computedCost
+  }
+
+// summary 附加总费用与均值字段
+const finalizeRecordSummary = (summary) => ({
+  ...summary,
+  totalCost: Number(summary.totalCost.toFixed(6)),
+  avgCost:
+    summary.totalRequests > 0 ? Number((summary.totalCost / summary.totalRequests).toFixed(6)) : 0
+})
+
 const accountTypeNames = {
   claude: 'Claude官方',
   'claude-official': 'Claude官方',
@@ -331,22 +1015,12 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
       accountTypeMap[platform] || null
     )
 
-    const history = []
-    let totalCost = 0
-    let totalRequests = 0
-    let totalTokens = 0
-
-    let highestCostDay = null
-    let highestRequestDay = null
+    const tracker = createUsageHistoryTracker()
 
     const sumModelCostsForDay = async (dateKey) => {
       const modelPattern = `account_usage:model:daily:${accountId}:*:${dateKey}`
       const modelResults = await redis.scanAndGetAllChunked(modelPattern)
       let summedCost = 0
-
-      if (modelResults.length === 0) {
-        return summedCost
-      }
 
       for (const { key: modelKey, data: modelData } of modelResults) {
         const modelParts = modelKey.split(':')
@@ -355,25 +1029,8 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
           continue
         }
 
-        const usage = {
-          input_tokens: parseInt(modelData.inputTokens) || 0,
-          output_tokens: parseInt(modelData.outputTokens) || 0,
-          cache_creation_input_tokens: parseInt(modelData.cacheCreateTokens) || 0,
-          cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
-        }
-
-        // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-        const eph5m = parseInt(modelData.ephemeral5mTokens) || 0
-        const eph1h = parseInt(modelData.ephemeral1hTokens) || 0
-        if (eph5m > 0 || eph1h > 0) {
-          usage.cache_creation = {
-            ephemeral_5m_input_tokens: eph5m,
-            ephemeral_1h_input_tokens: eph1h
-          }
-        }
-
-        const costResult = CostCalculator.calculateCost(usage, modelName)
-        summedCost += costResult.costs.total
+        summedCost += CostCalculator.calculateCost(buildBillingUsage(modelData), modelName).costs
+          .total
       }
 
       return summedCost
@@ -384,127 +1041,43 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
     for (let offset = daysCount - 1; offset >= 0; offset--) {
       const date = new Date(today)
       date.setDate(date.getDate() - offset)
-
-      const tzDate = redis.getDateInTimezone(date)
-      const dateKey = redis.getDateStringInTimezone(date)
-      const monthLabel = String(tzDate.getUTCMonth() + 1).padStart(2, '0')
-      const dayLabel = String(tzDate.getUTCDate()).padStart(2, '0')
-      const label = `${monthLabel}/${dayLabel}`
+      const { dateKey, label } = buildDayLabelInfo(date)
 
       const client = redis.getClientSafe()
       const dailyKey = `account_usage:daily:${accountId}:${dateKey}`
       const dailyData = await client.hgetall(dailyKey)
 
-      const inputTokens = parseInt(dailyData?.inputTokens) || 0
-      const outputTokens = parseInt(dailyData?.outputTokens) || 0
-      const cacheCreateTokens = parseInt(dailyData?.cacheCreateTokens) || 0
-      const cacheReadTokens = parseInt(dailyData?.cacheReadTokens) || 0
+      const inputTokens = toInt(dailyData?.inputTokens)
+      const outputTokens = toInt(dailyData?.outputTokens)
+      const cacheCreateTokens = toInt(dailyData?.cacheCreateTokens)
+      const cacheReadTokens = toInt(dailyData?.cacheReadTokens)
       const allTokens =
-        parseInt(dailyData?.allTokens) ||
+        toInt(dailyData?.allTokens) ||
         inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
-      const requests = parseInt(dailyData?.requests) || 0
+      const requests = toInt(dailyData?.requests)
 
       let cost = await sumModelCostsForDay(dateKey)
 
       if (cost === 0 && allTokens > 0) {
-        const fallbackUsage = {
-          input_tokens: inputTokens,
-          output_tokens: outputTokens,
-          cache_creation_input_tokens: cacheCreateTokens,
-          cache_read_input_tokens: cacheReadTokens
-        }
-        // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-        const fbEph5m = parseInt(dailyData?.ephemeral5mTokens) || 0
-        const fbEph1h = parseInt(dailyData?.ephemeral1hTokens) || 0
-        if (fbEph5m > 0 || fbEph1h > 0) {
-          fallbackUsage.cache_creation = {
-            ephemeral_5m_input_tokens: fbEph5m,
-            ephemeral_1h_input_tokens: fbEph1h
-          }
-        }
-        const fallbackResult = CostCalculator.calculateCost(fallbackUsage, fallbackModel)
-        cost = fallbackResult.costs.total
+        cost = CostCalculator.calculateCost(buildBillingUsage(dailyData || {}), fallbackModel).costs
+          .total
       }
 
       const normalizedCost = Math.round(cost * 1_000_000) / 1_000_000
-
-      totalCost += normalizedCost
-      totalRequests += requests
-      totalTokens += allTokens
-
-      if (!highestCostDay || normalizedCost > highestCostDay.cost) {
-        highestCostDay = {
-          date: dateKey,
-          label,
-          cost: normalizedCost,
-          formattedCost: CostCalculator.formatCost(normalizedCost)
-        }
-      }
-
-      if (!highestRequestDay || requests > highestRequestDay.requests) {
-        highestRequestDay = {
-          date: dateKey,
-          label,
-          requests
-        }
-      }
-
-      history.push({
-        date: dateKey,
-        label,
-        cost: normalizedCost,
-        formattedCost: CostCalculator.formatCost(normalizedCost),
-        requests,
-        tokens: allTokens
-      })
+      tracker.add({ dateKey, label, cost: normalizedCost, requests, tokens: allTokens })
     }
-
-    // 计算实际使用天数（从账户创建到现在）
-    let actualDaysForAvg = daysCount
-    if (accountCreatedAt) {
-      const now = new Date()
-      const diffTime = Math.abs(now - accountCreatedAt)
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
-      // 使用实际使用天数，但不超过请求的天数范围
-      actualDaysForAvg = Math.min(diffDays, daysCount)
-      // 至少为1天，避免除零
-      actualDaysForAvg = Math.max(actualDaysForAvg, 1)
-    }
-
-    // 使用实际天数计算日均值
-    const avgDailyCost = actualDaysForAvg > 0 ? totalCost / actualDaysForAvg : 0
-    const avgDailyRequests = actualDaysForAvg > 0 ? totalRequests / actualDaysForAvg : 0
-    const avgDailyTokens = actualDaysForAvg > 0 ? totalTokens / actualDaysForAvg : 0
-
-    const todayData = history.length > 0 ? history[history.length - 1] : null
 
     return res.json({
       success: true,
       data: {
-        history,
+        history: tracker.state.history,
         summary: {
-          days: daysCount,
-          actualDaysUsed: actualDaysForAvg, // 实际使用的天数（用于计算日均值）
-          accountCreatedAt: accountCreatedAt ? accountCreatedAt.toISOString() : null,
-          totalCost,
-          totalCostFormatted: CostCalculator.formatCost(totalCost),
-          totalRequests,
-          totalTokens,
-          avgDailyCost,
-          avgDailyCostFormatted: CostCalculator.formatCost(avgDailyCost),
-          avgDailyRequests,
-          avgDailyTokens,
-          today: todayData
-            ? {
-                date: todayData.date,
-                cost: todayData.cost,
-                costFormatted: todayData.formattedCost,
-                requests: todayData.requests,
-                tokens: todayData.tokens
-              }
-            : null,
-          highestCostDay,
-          highestRequestDay
+          ...buildUsageHistorySummary({
+            daysCount,
+            createdAt: accountCreatedAt,
+            state: tracker.state
+          }),
+          accountCreatedAt: accountCreatedAt ? accountCreatedAt.toISOString() : null
         },
         overview: accountUsageStats,
         generatedAt: new Date().toISOString()
@@ -538,24 +1111,13 @@ router.get('/api-keys/:keyId/usage-history', authenticateAdmin, async (req, res)
     const keyCreatedAt = keyData.createdAt ? new Date(keyData.createdAt) : null
     const keyUsageStats = await redis.getUsageStats(keyId)
 
-    const history = []
-    let totalCost = 0
-    let totalRequests = 0
-    let totalTokens = 0
-    let highestCostDay = null
-    let highestRequestDay = null
-
+    const tracker = createUsageHistoryTracker()
     const today = new Date()
 
     for (let offset = daysCount - 1; offset >= 0; offset--) {
       const date = new Date(today)
       date.setDate(date.getDate() - offset)
-
-      const tzDate = redis.getDateInTimezone(date)
-      const dateKey = redis.getDateStringInTimezone(date)
-      const monthLabel = String(tzDate.getUTCMonth() + 1).padStart(2, '0')
-      const dayLabel = String(tzDate.getUTCDate()).padStart(2, '0')
-      const label = `${monthLabel}/${dayLabel}`
+      const { dateKey, label } = buildDayLabelInfo(date)
 
       const dailyKey = `usage:daily:${keyId}:${dateKey}`
       const dailyData = await redis.client.hgetall(dailyKey)
@@ -597,21 +1159,14 @@ router.get('/api-keys/:keyId/usage-history', authenticateAdmin, async (req, res)
             continue
           }
 
-          const usage = {
-            input_tokens: modelInputTokens,
-            output_tokens: modelOutputTokens,
-            cache_creation_input_tokens: modelCacheCreateTokens,
-            cache_read_input_tokens: modelCacheReadTokens
-          }
-
-          const eph5m = parseInt(modelData.ephemeral5mTokens) || 0
-          const eph1h = parseInt(modelData.ephemeral1hTokens) || 0
-          if (eph5m > 0 || eph1h > 0) {
-            usage.cache_creation = {
-              ephemeral_5m_input_tokens: eph5m,
-              ephemeral_1h_input_tokens: eph1h
-            }
-          }
+          const usage = buildBillingUsage({
+            inputTokens: modelInputTokens,
+            outputTokens: modelOutputTokens,
+            cacheCreateTokens: modelCacheCreateTokens,
+            cacheReadTokens: modelCacheReadTokens,
+            ephemeral5mTokens: modelData.ephemeral5mTokens,
+            ephemeral1hTokens: modelData.ephemeral1hTokens
+          })
 
           const costResult = CostCalculator.calculateCost(usage, model)
           cost += costResult.costs.total
@@ -632,21 +1187,14 @@ router.get('/api-keys/:keyId/usage-history', authenticateAdmin, async (req, res)
           inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
 
         if (allTokens > 0) {
-          const usage = {
-            input_tokens: inputTokens,
-            output_tokens: outputTokens,
-            cache_creation_input_tokens: cacheCreateTokens,
-            cache_read_input_tokens: cacheReadTokens
-          }
-
-          const eph5m = parseInt(dailyData.ephemeral5mTokens) || 0
-          const eph1h = parseInt(dailyData.ephemeral1hTokens) || 0
-          if (eph5m > 0 || eph1h > 0) {
-            usage.cache_creation = {
-              ephemeral_5m_input_tokens: eph5m,
-              ephemeral_1h_input_tokens: eph1h
-            }
-          }
+          const usage = buildBillingUsage({
+            inputTokens,
+            outputTokens,
+            cacheCreateTokens,
+            cacheReadTokens,
+            ephemeral5mTokens: dailyData.ephemeral5mTokens,
+            ephemeral1hTokens: dailyData.ephemeral1hTokens
+          })
 
           const costResult = CostCalculator.calculateCost(usage, 'unknown')
           cost = costResult.costs.total
@@ -655,79 +1203,16 @@ router.get('/api-keys/:keyId/usage-history', authenticateAdmin, async (req, res)
 
       const tokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
       const normalizedCost = Math.round(cost * 1000000) / 1000000
-
-      totalCost += normalizedCost
-      totalRequests += requests
-      totalTokens += tokens
-
-      if (!highestCostDay || normalizedCost > highestCostDay.cost) {
-        highestCostDay = {
-          date: dateKey,
-          label,
-          cost: normalizedCost,
-          formattedCost: CostCalculator.formatCost(normalizedCost)
-        }
-      }
-
-      if (!highestRequestDay || requests > highestRequestDay.requests) {
-        highestRequestDay = {
-          date: dateKey,
-          label,
-          requests
-        }
-      }
-
-      history.push({
-        date: dateKey,
-        label,
-        cost: normalizedCost,
-        formattedCost: CostCalculator.formatCost(normalizedCost),
-        requests,
-        tokens
-      })
+      tracker.add({ dateKey, label, cost: normalizedCost, requests, tokens })
     }
-
-    let actualDaysForAvg = daysCount
-    if (keyCreatedAt) {
-      const now = new Date()
-      const diffTime = Math.abs(now - keyCreatedAt)
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
-      actualDaysForAvg = Math.min(diffDays, daysCount)
-      actualDaysForAvg = Math.max(actualDaysForAvg, 1)
-    }
-
-    const avgDailyCost = actualDaysForAvg > 0 ? totalCost / actualDaysForAvg : 0
-    const avgDailyRequests = actualDaysForAvg > 0 ? totalRequests / actualDaysForAvg : 0
-    const avgDailyTokens = actualDaysForAvg > 0 ? totalTokens / actualDaysForAvg : 0
-    const todayData = history.length > 0 ? history[history.length - 1] : null
 
     return res.json({
       success: true,
       data: {
-        history,
+        history: tracker.state.history,
         summary: {
-          days: daysCount,
-          actualDaysUsed: actualDaysForAvg,
-          keyCreatedAt: keyCreatedAt ? keyCreatedAt.toISOString() : null,
-          totalCost,
-          totalCostFormatted: CostCalculator.formatCost(totalCost),
-          totalRequests,
-          totalTokens,
-          avgDailyCost,
-          avgDailyCostFormatted: CostCalculator.formatCost(avgDailyCost),
-          avgDailyRequests,
-          avgDailyTokens,
-          today: todayData
-            ? {
-                date: todayData.date,
-                cost: todayData.cost,
-                costFormatted: todayData.formattedCost,
-                requests: todayData.requests,
-                tokens: todayData.tokens
-              }
-            : null,
-          highestCostDay,
-          highestRequestDay
+          ...buildUsageHistorySummary({ daysCount, createdAt: keyCreatedAt, state: tracker.state }),
+          keyCreatedAt: keyCreatedAt ? keyCreatedAt.toISOString() : null
         },
         overview: keyUsageStats,
         generatedAt: new Date().toISOString()
@@ -754,15 +1239,7 @@ router.get('/usage-trend', authenticateAdmin, async (req, res) => {
 
     if (granularity === 'hour') {
       // 小时粒度统计
-      let startTime, endTime
-
-      if (startDate && endDate) {
-        startTime = new Date(startDate)
-        endTime = new Date(endDate)
-      } else {
-        endTime = new Date()
-        startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000)
-      }
+      const { startTime, endTime } = resolveHourRange(startDate, endDate)
 
       // 确保时间范围不超过24小时
       const timeDiff = endTime - startTime
@@ -772,355 +1249,115 @@ router.get('/usage-trend', authenticateAdmin, async (req, res) => {
         })
       }
 
-      // 收集所有小时的元数据和涉及的日期
-      const hourInfos = []
-      const dateSet = new Set()
-      const currentHour = new Date(startTime)
-      currentHour.setMinutes(0, 0, 0)
-
-      while (currentHour <= endTime) {
-        const tzCurrentHour = redis.getDateInTimezone(currentHour)
-        const dateStr = redis.getDateStringInTimezone(currentHour)
-        const hour = String(tzCurrentHour.getUTCHours()).padStart(2, '0')
-        const hourKey = `${dateStr}:${hour}`
-
-        dateSet.add(dateStr)
-
-        const tzDateForLabel = redis.getDateInTimezone(currentHour)
-        const month = String(tzDateForLabel.getUTCMonth() + 1).padStart(2, '0')
-        const day = String(tzDateForLabel.getUTCDate()).padStart(2, '0')
-        const hourStr = String(tzDateForLabel.getUTCHours()).padStart(2, '0')
-
-        hourInfos.push({
-          hourKey,
-          dateStr,
-          isoTime: currentHour.toISOString(),
-          label: `${month}/${day} ${hourStr}:00`
-        })
-
-        currentHour.setHours(currentHour.getHours() + 1)
-      }
-
-      // 使用索引获取数据，按小时批量查询
-      const modelDataMap = new Map()
-      const usageDataMap = new Map()
-
-      // 并行获取所有小时的数据
-      const fetchPromises = hourInfos.map(async (hourInfo) => {
-        const [modelResults, usageResults] = await Promise.all([
-          getUsageDataByIndex(
-            `usage:model:hourly:index:${hourInfo.hourKey}`,
-            `usage:model:hourly:{id}:${hourInfo.hourKey}`,
-            `usage:model:hourly:*:${hourInfo.hourKey}`
-          ),
-          getUsageDataByIndex(
+      // 收集所有小时的元数据，并行按小时批量查询索引数据
+      const hourInfos = buildHourInfos(startTime, endTime)
+      const { usageDataMap, modelDataMap } = await fetchUsageAndModelMaps(
+        hourInfos,
+        (hourInfo) => ({
+          usage: [
             `usage:hourly:index:${hourInfo.hourKey}`,
             `usage:hourly:{id}:${hourInfo.hourKey}`,
             `usage:hourly:*:${hourInfo.hourKey}`
-          )
-        ])
-        return { modelResults, usageResults }
-      })
-
-      const allResults = await Promise.all(fetchPromises)
-      allResults.forEach(({ modelResults, usageResults }) => {
-        modelResults.forEach(({ key, data }) => modelDataMap.set(key, data))
-        usageResults.forEach(({ key, data }) => usageDataMap.set(key, data))
-      })
+          ],
+          model: [
+            `usage:model:hourly:index:${hourInfo.hourKey}`,
+            `usage:model:hourly:{id}:${hourInfo.hourKey}`,
+            `usage:model:hourly:*:${hourInfo.hourKey}`
+          ]
+        })
+      )
 
       // 按 hourKey 分组
-      const modelKeysByHour = new Map()
-      const usageKeysByHour = new Map()
-      for (const key of modelDataMap.keys()) {
-        const match = key.match(/usage:model:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/)
-        if (match) {
-          const hourKey = match[1]
-          if (!modelKeysByHour.has(hourKey)) {
-            modelKeysByHour.set(hourKey, [])
-          }
-          modelKeysByHour.get(hourKey).push(key)
-        }
-      }
-      for (const key of usageDataMap.keys()) {
-        const match = key.match(/usage:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/)
-        if (match) {
-          const hourKey = match[1]
-          if (!usageKeysByHour.has(hourKey)) {
-            usageKeysByHour.set(hourKey, [])
-          }
-          usageKeysByHour.get(hourKey).push(key)
-        }
-      }
+      const modelKeysByHour = groupKeysByRegex(
+        modelDataMap.keys(),
+        /usage:model:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/
+      )
+      const usageKeysByHour = groupKeysByRegex(
+        usageDataMap.keys(),
+        /usage:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/
+      )
 
       // 处理每个小时的数据
       for (const hourInfo of hourInfos) {
-        const modelKeys = modelKeysByHour.get(hourInfo.hourKey) || []
-        const usageKeys = usageKeysByHour.get(hourInfo.hourKey) || []
-
-        let hourInputTokens = 0
-        let hourOutputTokens = 0
-        let hourRequests = 0
-        let hourCacheCreateTokens = 0
-        let hourCacheReadTokens = 0
-        let hourCost = 0
-
-        // 处理模型级别数据
-        for (const modelKey of modelKeys) {
-          const modelMatch = modelKey.match(/usage:model:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/)
-          if (!modelMatch) {
-            continue
-          }
-
-          const model = modelMatch[1]
-          const data = modelDataMap.get(modelKey)
-          if (!data || Object.keys(data).length === 0) {
-            continue
-          }
-
-          const modelInputTokens = parseInt(data.inputTokens) || 0
-          const modelOutputTokens = parseInt(data.outputTokens) || 0
-          const modelCacheCreateTokens = parseInt(data.cacheCreateTokens) || 0
-          const modelCacheReadTokens = parseInt(data.cacheReadTokens) || 0
-          const modelRequests = parseInt(data.requests) || 0
-
-          hourInputTokens += modelInputTokens
-          hourOutputTokens += modelOutputTokens
-          hourCacheCreateTokens += modelCacheCreateTokens
-          hourCacheReadTokens += modelCacheReadTokens
-          hourRequests += modelRequests
-
-          const modelUsage = {
-            input_tokens: modelInputTokens,
-            output_tokens: modelOutputTokens,
-            cache_creation_input_tokens: modelCacheCreateTokens,
-            cache_read_input_tokens: modelCacheReadTokens
-          }
-          // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-          const mEph5m = parseInt(data.ephemeral5mTokens) || 0
-          const mEph1h = parseInt(data.ephemeral1hTokens) || 0
-          if (mEph5m > 0 || mEph1h > 0) {
-            modelUsage.cache_creation = {
-              ephemeral_5m_input_tokens: mEph5m,
-              ephemeral_1h_input_tokens: mEph1h
-            }
-          }
-          const modelCostResult = CostCalculator.calculateCost(modelUsage, model)
-          hourCost += modelCostResult.costs.total
-        }
-
-        // 如果没有模型级别的数据，尝试API Key级别的数据
-        if (modelKeys.length === 0) {
-          let hourEph5m = 0
-          let hourEph1h = 0
-          for (const key of usageKeys) {
-            const data = usageDataMap.get(key)
-            if (data) {
-              hourInputTokens += parseInt(data.inputTokens) || 0
-              hourOutputTokens += parseInt(data.outputTokens) || 0
-              hourRequests += parseInt(data.requests) || 0
-              hourCacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
-              hourCacheReadTokens += parseInt(data.cacheReadTokens) || 0
-              hourEph5m += parseInt(data.ephemeral5mTokens) || 0
-              hourEph1h += parseInt(data.ephemeral1hTokens) || 0
-            }
-          }
-
-          const usage = {
-            input_tokens: hourInputTokens,
-            output_tokens: hourOutputTokens,
-            cache_creation_input_tokens: hourCacheCreateTokens,
-            cache_read_input_tokens: hourCacheReadTokens
-          }
-          // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-          if (hourEph5m > 0 || hourEph1h > 0) {
-            usage.cache_creation = {
-              ephemeral_5m_input_tokens: hourEph5m,
-              ephemeral_1h_input_tokens: hourEph1h
-            }
-          }
-          const costResult = CostCalculator.calculateCost(usage, 'unknown')
-          hourCost = costResult.costs.total
-        }
+        const bucket = aggregateTrendBucket({
+          modelKeys: modelKeysByHour.get(hourInfo.hourKey) || [],
+          usageKeys: usageKeysByHour.get(hourInfo.hourKey) || [],
+          modelDataMap,
+          usageDataMap,
+          modelKeyRegex: /usage:model:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/,
+          requireUsageKeys: false
+        })
 
         trendData.push({
           hour: hourInfo.isoTime,
           label: hourInfo.label,
-          inputTokens: hourInputTokens,
-          outputTokens: hourOutputTokens,
-          requests: hourRequests,
-          cacheCreateTokens: hourCacheCreateTokens,
-          cacheReadTokens: hourCacheReadTokens,
+          inputTokens: bucket.inputTokens,
+          outputTokens: bucket.outputTokens,
+          requests: bucket.requests,
+          cacheCreateTokens: bucket.cacheCreateTokens,
+          cacheReadTokens: bucket.cacheReadTokens,
           totalTokens:
-            hourInputTokens + hourOutputTokens + hourCacheCreateTokens + hourCacheReadTokens,
-          cost: hourCost
+            bucket.inputTokens +
+            bucket.outputTokens +
+            bucket.cacheCreateTokens +
+            bucket.cacheReadTokens,
+          cost: bucket.cost
         })
       }
     } else {
       // 天粒度统计（按日期集合扫描）
       const daysCount = parseInt(days) || 7
-      const today = new Date()
-
-      // 收集所有天的元数据
-      const dayInfos = []
-      for (let i = 0; i < daysCount; i++) {
-        const date = new Date(today)
-        date.setDate(date.getDate() - i)
-        const dateStr = redis.getDateStringInTimezone(date)
-        dayInfos.push({ dateStr })
-      }
+      const dayInfos = buildDayInfos(daysCount)
 
       // 使用索引获取数据，按日期批量查询
-      const modelDataMap = new Map()
-      const usageDataMap = new Map()
-
-      const fetchPromises = dayInfos.map(async (dayInfo) => {
-        const [modelResults, usageResults] = await Promise.all([
-          getUsageDataByIndex(
-            `usage:model:daily:index:${dayInfo.dateStr}`,
-            `usage:model:daily:{id}:${dayInfo.dateStr}`,
-            `usage:model:daily:*:${dayInfo.dateStr}`
-          ),
-          getUsageDataByIndex(
-            `usage:daily:index:${dayInfo.dateStr}`,
-            `usage:daily:{id}:${dayInfo.dateStr}`,
-            `usage:daily:*:${dayInfo.dateStr}`
-          )
-        ])
-        return { modelResults, usageResults }
-      })
-
-      const allResults = await Promise.all(fetchPromises)
-      allResults.forEach(({ modelResults, usageResults }) => {
-        modelResults.forEach(({ key, data }) => modelDataMap.set(key, data))
-        usageResults.forEach(({ key, data }) => usageDataMap.set(key, data))
-      })
+      const { usageDataMap, modelDataMap } = await fetchUsageAndModelMaps(dayInfos, (dayInfo) => ({
+        usage: [
+          `usage:daily:index:${dayInfo.dateStr}`,
+          `usage:daily:{id}:${dayInfo.dateStr}`,
+          `usage:daily:*:${dayInfo.dateStr}`
+        ],
+        model: [
+          `usage:model:daily:index:${dayInfo.dateStr}`,
+          `usage:model:daily:{id}:${dayInfo.dateStr}`,
+          `usage:model:daily:*:${dayInfo.dateStr}`
+        ]
+      }))
 
       // 按 dateStr 分组
-      const modelKeysByDate = new Map()
-      const usageKeysByDate = new Map()
-      for (const key of modelDataMap.keys()) {
-        const match = key.match(/usage:model:daily:.+?:(\d{4}-\d{2}-\d{2})/)
-        if (match) {
-          const dateStr = match[1]
-          if (!modelKeysByDate.has(dateStr)) {
-            modelKeysByDate.set(dateStr, [])
-          }
-          modelKeysByDate.get(dateStr).push(key)
-        }
-      }
-      for (const key of usageDataMap.keys()) {
-        const match = key.match(/usage:daily:.+?:(\d{4}-\d{2}-\d{2})/)
-        if (match) {
-          const dateStr = match[1]
-          if (!usageKeysByDate.has(dateStr)) {
-            usageKeysByDate.set(dateStr, [])
-          }
-          usageKeysByDate.get(dateStr).push(key)
-        }
-      }
+      const modelKeysByDate = groupKeysByRegex(
+        modelDataMap.keys(),
+        /usage:model:daily:.+?:(\d{4}-\d{2}-\d{2})/
+      )
+      const usageKeysByDate = groupKeysByRegex(
+        usageDataMap.keys(),
+        /usage:daily:.+?:(\d{4}-\d{2}-\d{2})/
+      )
 
       // 处理每天的数据
       for (const dayInfo of dayInfos) {
-        const modelKeys = modelKeysByDate.get(dayInfo.dateStr) || []
-        const usageKeys = usageKeysByDate.get(dayInfo.dateStr) || []
-
-        let dayInputTokens = 0
-        let dayOutputTokens = 0
-        let dayRequests = 0
-        let dayCacheCreateTokens = 0
-        let dayCacheReadTokens = 0
-        let dayCost = 0
-
-        // 处理模型级别数据
-        for (const modelKey of modelKeys) {
-          const modelMatch = modelKey.match(/usage:model:daily:(.+?):\d{4}-\d{2}-\d{2}/)
-          if (!modelMatch) {
-            continue
-          }
-
-          const model = modelMatch[1]
-          const data = modelDataMap.get(modelKey)
-          if (!data || Object.keys(data).length === 0) {
-            continue
-          }
-
-          const modelInputTokens = parseInt(data.inputTokens) || 0
-          const modelOutputTokens = parseInt(data.outputTokens) || 0
-          const modelCacheCreateTokens = parseInt(data.cacheCreateTokens) || 0
-          const modelCacheReadTokens = parseInt(data.cacheReadTokens) || 0
-          const modelEphemeral5mTokens = parseInt(data.ephemeral5mTokens) || 0
-          const modelEphemeral1hTokens = parseInt(data.ephemeral1hTokens) || 0
-          const modelRequests = parseInt(data.requests) || 0
-
-          dayInputTokens += modelInputTokens
-          dayOutputTokens += modelOutputTokens
-          dayCacheCreateTokens += modelCacheCreateTokens
-          dayCacheReadTokens += modelCacheReadTokens
-          dayRequests += modelRequests
-
-          const modelUsage = {
-            input_tokens: modelInputTokens,
-            output_tokens: modelOutputTokens,
-            cache_creation_input_tokens: modelCacheCreateTokens,
-            cache_read_input_tokens: modelCacheReadTokens
-          }
-
-          // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-          if (modelEphemeral5mTokens > 0 || modelEphemeral1hTokens > 0) {
-            modelUsage.cache_creation = {
-              ephemeral_5m_input_tokens: modelEphemeral5mTokens,
-              ephemeral_1h_input_tokens: modelEphemeral1hTokens
-            }
-          }
-
-          const modelCostResult = CostCalculator.calculateCost(modelUsage, model)
-          dayCost += modelCostResult.costs.total
-        }
-
-        // 如果没有模型级别的数据，回退到原始方法
-        if (modelKeys.length === 0 && usageKeys.length > 0) {
-          let dayEph5m = 0
-          let dayEph1h = 0
-          for (const key of usageKeys) {
-            const data = usageDataMap.get(key)
-            if (data) {
-              dayInputTokens += parseInt(data.inputTokens) || 0
-              dayOutputTokens += parseInt(data.outputTokens) || 0
-              dayRequests += parseInt(data.requests) || 0
-              dayCacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
-              dayCacheReadTokens += parseInt(data.cacheReadTokens) || 0
-              dayEph5m += parseInt(data.ephemeral5mTokens) || 0
-              dayEph1h += parseInt(data.ephemeral1hTokens) || 0
-            }
-          }
-
-          const usage = {
-            input_tokens: dayInputTokens,
-            output_tokens: dayOutputTokens,
-            cache_creation_input_tokens: dayCacheCreateTokens,
-            cache_read_input_tokens: dayCacheReadTokens
-          }
-          // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-          if (dayEph5m > 0 || dayEph1h > 0) {
-            usage.cache_creation = {
-              ephemeral_5m_input_tokens: dayEph5m,
-              ephemeral_1h_input_tokens: dayEph1h
-            }
-          }
-          const costResult = CostCalculator.calculateCost(usage, 'unknown')
-          dayCost = costResult.costs.total
-        }
+        const bucket = aggregateTrendBucket({
+          modelKeys: modelKeysByDate.get(dayInfo.dateStr) || [],
+          usageKeys: usageKeysByDate.get(dayInfo.dateStr) || [],
+          modelDataMap,
+          usageDataMap,
+          modelKeyRegex: /usage:model:daily:(.+?):\d{4}-\d{2}-\d{2}/,
+          requireUsageKeys: true
+        })
 
         trendData.push({
           date: dayInfo.dateStr,
-          inputTokens: dayInputTokens,
-          outputTokens: dayOutputTokens,
-          requests: dayRequests,
-          cacheCreateTokens: dayCacheCreateTokens,
-          cacheReadTokens: dayCacheReadTokens,
-          totalTokens: dayInputTokens + dayOutputTokens + dayCacheCreateTokens + dayCacheReadTokens,
-          cost: dayCost,
-          formattedCost: CostCalculator.formatCost(dayCost)
+          inputTokens: bucket.inputTokens,
+          outputTokens: bucket.outputTokens,
+          requests: bucket.requests,
+          cacheCreateTokens: bucket.cacheCreateTokens,
+          cacheReadTokens: bucket.cacheReadTokens,
+          totalTokens:
+            bucket.inputTokens +
+            bucket.outputTokens +
+            bucket.cacheCreateTokens +
+            bucket.cacheReadTokens,
+          cost: bucket.cost,
+          formattedCost: CostCalculator.formatCost(bucket.cost)
         })
       }
     }
@@ -1225,35 +1462,7 @@ router.get('/api-keys/:keyId/model-stats', authenticateAdmin, async (req, res) =
             continue
           }
           const model = match[1]
-          if (!modelStatsMap.has(model)) {
-            modelStatsMap.set(model, {
-              requests: 0,
-              inputTokens: 0,
-              outputTokens: 0,
-              cacheCreateTokens: 0,
-              cacheReadTokens: 0,
-              ephemeral5mTokens: 0,
-              ephemeral1hTokens: 0,
-              allTokens: 0,
-              realCostMicro: 0,
-              ratedCostMicro: 0,
-              hasStoredCost: false
-            })
-          }
-          const stats = modelStatsMap.get(model)
-          stats.requests += parseInt(data.requests) || 0
-          stats.inputTokens += parseInt(data.inputTokens) || 0
-          stats.outputTokens += parseInt(data.outputTokens) || 0
-          stats.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
-          stats.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
-          stats.ephemeral5mTokens += parseInt(data.ephemeral5mTokens) || 0
-          stats.ephemeral1hTokens += parseInt(data.ephemeral1hTokens) || 0
-          stats.allTokens += parseInt(data.allTokens) || 0
-          if ('realCostMicro' in data || 'ratedCostMicro' in data) {
-            stats.realCostMicro += parseInt(data.realCostMicro) || 0
-            stats.ratedCostMicro += parseInt(data.ratedCostMicro) || 0
-            stats.hasStoredCost = true
-          }
+          accumulateModelStats(modelStatsMap, model, data)
         }
       }
     } else {
@@ -1281,35 +1490,7 @@ router.get('/api-keys/:keyId/model-stats', authenticateAdmin, async (req, res) =
           continue
         }
         const model = match[1]
-        if (!modelStatsMap.has(model)) {
-          modelStatsMap.set(model, {
-            requests: 0,
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheCreateTokens: 0,
-            cacheReadTokens: 0,
-            ephemeral5mTokens: 0,
-            ephemeral1hTokens: 0,
-            allTokens: 0,
-            realCostMicro: 0,
-            ratedCostMicro: 0,
-            hasStoredCost: false
-          })
-        }
-        const stats = modelStatsMap.get(model)
-        stats.requests += parseInt(data.requests) || 0
-        stats.inputTokens += parseInt(data.inputTokens) || 0
-        stats.outputTokens += parseInt(data.outputTokens) || 0
-        stats.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
-        stats.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
-        stats.ephemeral5mTokens += parseInt(data.ephemeral5mTokens) || 0
-        stats.ephemeral1hTokens += parseInt(data.ephemeral1hTokens) || 0
-        stats.allTokens += parseInt(data.allTokens) || 0
-        if ('realCostMicro' in data || 'ratedCostMicro' in data) {
-          stats.realCostMicro += parseInt(data.realCostMicro) || 0
-          stats.ratedCostMicro += parseInt(data.ratedCostMicro) || 0
-          stats.hasStoredCost = true
-        }
+        accumulateModelStats(modelStatsMap, model, data)
       }
     }
 
@@ -1483,24 +1664,16 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
       ])
 
       accounts = [
-        ...claudeAccounts.map((account) => {
-          const id = String(account.id || '')
-          const shortId = id ? id.slice(0, 8) : '未知'
-          return {
-            id,
-            name: account.name || account.email || `Claude账号 ${shortId}`,
-            platform: 'claude'
-          }
-        }),
-        ...claudeConsoleAccounts.map((account) => {
-          const id = String(account.id || '')
-          const shortId = id ? id.slice(0, 8) : '未知'
-          return {
-            id,
-            name: account.name || `Console账号 ${shortId}`,
-            platform: 'claude-console'
-          }
-        })
+        ...mapTrendAccounts(
+          claudeAccounts,
+          'claude',
+          (account, shortId) => account.name || account.email || `Claude账号 ${shortId}`
+        ),
+        ...mapTrendAccounts(
+          claudeConsoleAccounts,
+          'claude-console',
+          (account, shortId) => account.name || `Console账号 ${shortId}`
+        )
       ]
     } else if (group === 'openai') {
       const [openaiAccounts, openaiResponsesAccounts] = await Promise.all([
@@ -1509,24 +1682,16 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
       ])
 
       accounts = [
-        ...openaiAccounts.map((account) => {
-          const id = String(account.id || '')
-          const shortId = id ? id.slice(0, 8) : '未知'
-          return {
-            id,
-            name: account.name || account.email || `OpenAI账号 ${shortId}`,
-            platform: 'openai'
-          }
-        }),
-        ...openaiResponsesAccounts.map((account) => {
-          const id = String(account.id || '')
-          const shortId = id ? id.slice(0, 8) : '未知'
-          return {
-            id,
-            name: account.name || `Responses账号 ${shortId}`,
-            platform: 'openai-responses'
-          }
-        })
+        ...mapTrendAccounts(
+          openaiAccounts,
+          'openai',
+          (account, shortId) => account.name || account.email || `OpenAI账号 ${shortId}`
+        ),
+        ...mapTrendAccounts(
+          openaiResponsesAccounts,
+          'openai-responses',
+          (account, shortId) => account.name || `Responses账号 ${shortId}`
+        )
       ]
     } else if (group === 'gemini') {
       const [geminiAccounts, geminiApiAccounts] = await Promise.all([
@@ -1535,48 +1700,33 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
       ])
 
       accounts = [
-        ...geminiAccounts.map((account) => {
-          const id = String(account.id || '')
-          const shortId = id ? id.slice(0, 8) : '未知'
-          return {
-            id,
-            name: account.name || account.email || `Gemini账号 ${shortId}`,
-            platform: 'gemini'
-          }
-        }),
-        ...geminiApiAccounts.map((account) => {
-          const id = String(account.id || '')
-          const shortId = id ? id.slice(0, 8) : '未知'
-          return {
-            id,
-            name: account.name || `Gemini-API账号 ${shortId}`,
-            platform: 'gemini-api'
-          }
-        })
+        ...mapTrendAccounts(
+          geminiAccounts,
+          'gemini',
+          (account, shortId) => account.name || account.email || `Gemini账号 ${shortId}`
+        ),
+        ...mapTrendAccounts(
+          geminiApiAccounts,
+          'gemini-api',
+          (account, shortId) => account.name || `Gemini-API账号 ${shortId}`
+        )
       ]
     } else if (group === 'droid') {
       const droidAccounts = await droidAccountService.getAllAccounts()
-      accounts = droidAccounts.map((account) => {
-        const id = String(account.id || '')
-        const shortId = id ? id.slice(0, 8) : '未知'
-        return {
-          id,
-          name: account.name || account.ownerEmail || account.ownerName || `Droid账号 ${shortId}`,
-          platform: 'droid'
-        }
-      })
+      accounts = mapTrendAccounts(
+        droidAccounts,
+        'droid',
+        (account, shortId) =>
+          account.name || account.ownerEmail || account.ownerName || `Droid账号 ${shortId}`
+      )
     } else if (group === 'bedrock') {
       const result = await bedrockAccountService.getAllAccounts()
       const bedrockAccounts = result?.success ? result.data : []
-      accounts = bedrockAccounts.map((account) => {
-        const id = String(account.id || '')
-        const shortId = id ? id.slice(0, 8) : '未知'
-        return {
-          id,
-          name: account.name || `Bedrock账号 ${shortId}`,
-          platform: 'bedrock'
-        }
-      })
+      accounts = mapTrendAccounts(
+        bedrockAccounts,
+        'bedrock',
+        (account, shortId) => account.name || `Bedrock账号 ${shortId}`
+      )
     }
 
     if (!accounts || accounts.length === 0) {
@@ -1612,382 +1762,99 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
     const accountCostTotals = new Map()
 
     if (granularity === 'hour') {
-      let startTime
-      let endTime
-
-      if (startDate && endDate) {
-        startTime = new Date(startDate)
-        endTime = new Date(endDate)
-      } else {
-        endTime = new Date()
-        startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000)
-      }
-
-      // 收集所有小时的元数据和涉及的日期
-      const hourInfos = []
-      const dateSet = new Set()
-      const currentHour = new Date(startTime)
-      currentHour.setMinutes(0, 0, 0)
-
-      while (currentHour <= endTime) {
-        const tzCurrentHour = redis.getDateInTimezone(currentHour)
-        const dateStr = redis.getDateStringInTimezone(currentHour)
-        const hour = String(tzCurrentHour.getUTCHours()).padStart(2, '0')
-        const hourKey = `${dateStr}:${hour}`
-
-        dateSet.add(dateStr)
-
-        const tzDateForLabel = redis.getDateInTimezone(currentHour)
-        const monthLabel = String(tzDateForLabel.getUTCMonth() + 1).padStart(2, '0')
-        const dayLabel = String(tzDateForLabel.getUTCDate()).padStart(2, '0')
-        const hourLabel = String(tzDateForLabel.getUTCHours()).padStart(2, '0')
-
-        hourInfos.push({
-          hourKey,
-          dateStr,
-          isoTime: currentHour.toISOString(),
-          label: `${monthLabel}/${dayLabel} ${hourLabel}:00`
-        })
-
-        currentHour.setHours(currentHour.getHours() + 1)
-      }
+      const { startTime, endTime } = resolveHourRange(startDate, endDate)
+      const hourInfos = buildHourInfos(startTime, endTime)
 
       // 按小时获取 account_usage 数据（避免全库扫描）
-      const _dates = [...dateSet]
-      const usageDataMap = new Map()
-      const modelDataMap = new Map()
-
-      // 并行获取每个小时的数据
-      const fetchPromises = hourInfos.map(async (hourInfo) => {
-        const [usageResults, modelResults] = await Promise.all([
-          getUsageDataByIndex(
-            `account_usage:hourly:index:${hourInfo.hourKey}`,
-            `account_usage:hourly:{id}:${hourInfo.hourKey}`,
-            `account_usage:hourly:*:${hourInfo.hourKey}`
-          ),
-          getUsageDataByIndex(
-            `account_usage:model:hourly:index:${hourInfo.hourKey}`,
-            `account_usage:model:hourly:{accountId}:{model}:${hourInfo.hourKey}`,
-            `account_usage:model:hourly:*:${hourInfo.hourKey}`
-          )
-        ])
-        return { usageResults, modelResults }
-      })
-
-      const allResults = await Promise.all(fetchPromises)
-      allResults.forEach(({ usageResults, modelResults }) => {
-        usageResults.forEach(({ key, data }) => usageDataMap.set(key, data))
-        modelResults.forEach(({ key, data }) => modelDataMap.set(key, data))
-      })
+      const { usageDataMap, modelDataMap } = await fetchUsageAndModelMaps(hourInfos, (info) => ({
+        usage: [
+          `account_usage:hourly:index:${info.hourKey}`,
+          `account_usage:hourly:{id}:${info.hourKey}`,
+          `account_usage:hourly:*:${info.hourKey}`
+        ],
+        model: [
+          `account_usage:model:hourly:index:${info.hourKey}`,
+          `account_usage:model:hourly:{accountId}:{model}:${info.hourKey}`,
+          `account_usage:model:hourly:*:${info.hourKey}`
+        ]
+      }))
 
       // 按 hourKey 分组
-      const usageKeysByHour = new Map()
-      const modelKeysByHour = new Map()
-      for (const key of usageDataMap.keys()) {
-        const match = key.match(/account_usage:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/)
-        if (match) {
-          const hourKey = match[1]
-          if (!usageKeysByHour.has(hourKey)) {
-            usageKeysByHour.set(hourKey, [])
-          }
-          usageKeysByHour.get(hourKey).push(key)
-        }
-      }
-      for (const key of modelDataMap.keys()) {
-        const match = key.match(/account_usage:model:hourly:(.+?):.+?:(\d{4}-\d{2}-\d{2}:\d{2})/)
-        if (match) {
-          const accountId = match[1]
-          const hourKey = match[2]
-          const mapKey = `${accountId}:${hourKey}`
-          if (!modelKeysByHour.has(mapKey)) {
-            modelKeysByHour.set(mapKey, [])
-          }
-          modelKeysByHour.get(mapKey).push(key)
-        }
-      }
+      const usageKeysByHour = groupKeysByRegex(
+        usageDataMap.keys(),
+        /account_usage:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/
+      )
+      const modelKeysByHour = groupKeysByRegex(
+        modelDataMap.keys(),
+        /account_usage:model:hourly:(.+?):.+?:(\d{4}-\d{2}-\d{2}:\d{2})/,
+        (match) => `${match[1]}:${match[2]}`
+      )
 
       // 处理每个小时的数据
       for (const hourInfo of hourInfos) {
-        const usageKeys = usageKeysByHour.get(hourInfo.hourKey) || []
-
-        const hourData = {
+        trendData.push({
           hour: hourInfo.isoTime,
           label: hourInfo.label,
-          accounts: {}
-        }
-
-        for (const key of usageKeys) {
-          const match = key.match(/account_usage:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/)
-          if (!match) {
-            continue
-          }
-
-          const accountId = match[1]
-          if (!accountIdSet.has(accountId)) {
-            continue
-          }
-
-          const data = usageDataMap.get(key)
-          if (!data) {
-            continue
-          }
-
-          const inputTokens = parseInt(data.inputTokens) || 0
-          const outputTokens = parseInt(data.outputTokens) || 0
-          const cacheCreateTokens = parseInt(data.cacheCreateTokens) || 0
-          const cacheReadTokens = parseInt(data.cacheReadTokens) || 0
-          const allTokens =
-            parseInt(data.allTokens) ||
-            inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
-          const requests = parseInt(data.requests) || 0
-
-          // 计算模型费用（从预加载的数据中）
-          let cost = 0
-          const modelKeys = modelKeysByHour.get(`${accountId}:${hourInfo.hourKey}`) || []
-          for (const modelKey of modelKeys) {
-            const modelData = modelDataMap.get(modelKey)
-            if (!modelData) {
-              continue
-            }
-
-            const parts = modelKey.split(':')
-            if (parts.length < 5) {
-              continue
-            }
-
-            const modelName = parts[4]
-            const usage = {
-              input_tokens: parseInt(modelData.inputTokens) || 0,
-              output_tokens: parseInt(modelData.outputTokens) || 0,
-              cache_creation_input_tokens: parseInt(modelData.cacheCreateTokens) || 0,
-              cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
-            }
-
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const eph5m = parseInt(modelData.ephemeral5mTokens) || 0
-            const eph1h = parseInt(modelData.ephemeral1hTokens) || 0
-            if (eph5m > 0 || eph1h > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: eph5m,
-                ephemeral_1h_input_tokens: eph1h
-              }
-            }
-
-            const costResult = CostCalculator.calculateCost(usage, modelName)
-            cost += costResult.costs.total
-          }
-
-          if (cost === 0 && allTokens > 0) {
-            const fallbackUsage = {
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              cache_creation_input_tokens: cacheCreateTokens,
-              cache_read_input_tokens: cacheReadTokens
-            }
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const fbEph5m = parseInt(data.ephemeral5mTokens) || 0
-            const fbEph1h = parseInt(data.ephemeral1hTokens) || 0
-            if (fbEph5m > 0 || fbEph1h > 0) {
-              fallbackUsage.cache_creation = {
-                ephemeral_5m_input_tokens: fbEph5m,
-                ephemeral_1h_input_tokens: fbEph1h
-              }
-            }
-            const fallbackResult = CostCalculator.calculateCost(fallbackUsage, fallbackModel)
-            cost = fallbackResult.costs.total
-          }
-
-          const formattedCost = CostCalculator.formatCost(cost)
-          const accountInfo = accountMap.get(accountId)
-
-          hourData.accounts[accountId] = {
-            name: accountInfo ? accountInfo.name : `账号 ${accountId.slice(0, 8)}`,
-            cost,
-            formattedCost,
-            requests
-          }
-
-          accountCostTotals.set(accountId, (accountCostTotals.get(accountId) || 0) + cost)
-        }
-
-        trendData.push(hourData)
+          accounts: buildAccountBucketStats({
+            usageKeys: usageKeysByHour.get(hourInfo.hourKey) || [],
+            usageDataMap,
+            modelKeysMap: modelKeysByHour,
+            modelDataMap,
+            bucketKey: hourInfo.hourKey,
+            usageKeyRegex: /account_usage:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/,
+            accountIdSet,
+            accountMap,
+            fallbackModel,
+            accountCostTotals
+          })
+        })
       }
     } else {
       const daysCount = parseInt(days) || 7
-      const today = new Date()
-
-      // 收集所有天的元数据
-      const dayInfos = []
-      for (let i = 0; i < daysCount; i++) {
-        const date = new Date(today)
-        date.setDate(date.getDate() - i)
-        const dateStr = redis.getDateStringInTimezone(date)
-        dayInfos.push({ dateStr })
-      }
+      const dayInfos = buildDayInfos(daysCount)
 
       // 使用索引获取数据
-      const usagePromises = dayInfos.map((d) =>
-        getUsageDataByIndex(
-          `account_usage:daily:index:${d.dateStr}`,
-          `account_usage:daily:{id}:${d.dateStr}`,
-          `account_usage:daily:*:${d.dateStr}`
-        )
-      )
-      const modelPromises = dayInfos.map((d) =>
-        getUsageDataByIndex(
-          `account_usage:model:daily:index:${d.dateStr}`,
-          `account_usage:model:daily:{accountId}:{model}:${d.dateStr}`,
-          `account_usage:model:daily:*:${d.dateStr}`
-        )
-      )
-      const [usageResultsArr, modelResultsArr] = await Promise.all([
-        Promise.all(usagePromises),
-        Promise.all(modelPromises)
-      ])
-
-      const usageDataMap = new Map()
-      const modelDataMap = new Map()
-      for (const results of usageResultsArr) {
-        for (const { key, data } of results) {
-          usageDataMap.set(key, data)
-        }
-      }
-      for (const results of modelResultsArr) {
-        for (const { key, data } of results) {
-          modelDataMap.set(key, data)
-        }
-      }
+      const { usageDataMap, modelDataMap } = await fetchUsageAndModelMaps(dayInfos, (info) => ({
+        usage: [
+          `account_usage:daily:index:${info.dateStr}`,
+          `account_usage:daily:{id}:${info.dateStr}`,
+          `account_usage:daily:*:${info.dateStr}`
+        ],
+        model: [
+          `account_usage:model:daily:index:${info.dateStr}`,
+          `account_usage:model:daily:{accountId}:{model}:${info.dateStr}`,
+          `account_usage:model:daily:*:${info.dateStr}`
+        ]
+      }))
 
       // 按 dateStr 分组
-      const usageKeysByDate = new Map()
-      const modelKeysByDate = new Map()
-      for (const key of usageDataMap.keys()) {
-        const match = key.match(/account_usage:daily:.+?:(\d{4}-\d{2}-\d{2})/)
-        if (match) {
-          const dateStr = match[1]
-          if (!usageKeysByDate.has(dateStr)) {
-            usageKeysByDate.set(dateStr, [])
-          }
-          usageKeysByDate.get(dateStr).push(key)
-        }
-      }
-      for (const key of modelDataMap.keys()) {
-        const match = key.match(/account_usage:model:daily:(.+?):.+?:(\d{4}-\d{2}-\d{2})/)
-        if (match) {
-          const accountId = match[1]
-          const dateStr = match[2]
-          const mapKey = `${accountId}:${dateStr}`
-          if (!modelKeysByDate.has(mapKey)) {
-            modelKeysByDate.set(mapKey, [])
-          }
-          modelKeysByDate.get(mapKey).push(key)
-        }
-      }
+      const usageKeysByDate = groupKeysByRegex(
+        usageDataMap.keys(),
+        /account_usage:daily:.+?:(\d{4}-\d{2}-\d{2})/
+      )
+      const modelKeysByDate = groupKeysByRegex(
+        modelDataMap.keys(),
+        /account_usage:model:daily:(.+?):.+?:(\d{4}-\d{2}-\d{2})/,
+        (match) => `${match[1]}:${match[2]}`
+      )
 
       // 处理每天的数据
       for (const dayInfo of dayInfos) {
-        const usageKeys = usageKeysByDate.get(dayInfo.dateStr) || []
-
-        const dayData = {
+        trendData.push({
           date: dayInfo.dateStr,
-          accounts: {}
-        }
-
-        for (const key of usageKeys) {
-          const match = key.match(/account_usage:daily:(.+?):\d{4}-\d{2}-\d{2}/)
-          if (!match) {
-            continue
-          }
-
-          const accountId = match[1]
-          if (!accountIdSet.has(accountId)) {
-            continue
-          }
-
-          const data = usageDataMap.get(key)
-          if (!data) {
-            continue
-          }
-
-          const inputTokens = parseInt(data.inputTokens) || 0
-          const outputTokens = parseInt(data.outputTokens) || 0
-          const cacheCreateTokens = parseInt(data.cacheCreateTokens) || 0
-          const cacheReadTokens = parseInt(data.cacheReadTokens) || 0
-          const allTokens =
-            parseInt(data.allTokens) ||
-            inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
-          const requests = parseInt(data.requests) || 0
-
-          // 计算模型费用（从预加载的数据中）
-          let cost = 0
-          const modelKeys = modelKeysByDate.get(`${accountId}:${dayInfo.dateStr}`) || []
-          for (const modelKey of modelKeys) {
-            const modelData = modelDataMap.get(modelKey)
-            if (!modelData) {
-              continue
-            }
-
-            const parts = modelKey.split(':')
-            if (parts.length < 5) {
-              continue
-            }
-
-            const modelName = parts[4]
-            const usage = {
-              input_tokens: parseInt(modelData.inputTokens) || 0,
-              output_tokens: parseInt(modelData.outputTokens) || 0,
-              cache_creation_input_tokens: parseInt(modelData.cacheCreateTokens) || 0,
-              cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
-            }
-
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const eph5m = parseInt(modelData.ephemeral5mTokens) || 0
-            const eph1h = parseInt(modelData.ephemeral1hTokens) || 0
-            if (eph5m > 0 || eph1h > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: eph5m,
-                ephemeral_1h_input_tokens: eph1h
-              }
-            }
-
-            const costResult = CostCalculator.calculateCost(usage, modelName)
-            cost += costResult.costs.total
-          }
-
-          if (cost === 0 && allTokens > 0) {
-            const fallbackUsage = {
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              cache_creation_input_tokens: cacheCreateTokens,
-              cache_read_input_tokens: cacheReadTokens
-            }
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const fbEph5m = parseInt(data.ephemeral5mTokens) || 0
-            const fbEph1h = parseInt(data.ephemeral1hTokens) || 0
-            if (fbEph5m > 0 || fbEph1h > 0) {
-              fallbackUsage.cache_creation = {
-                ephemeral_5m_input_tokens: fbEph5m,
-                ephemeral_1h_input_tokens: fbEph1h
-              }
-            }
-            const fallbackResult = CostCalculator.calculateCost(fallbackUsage, fallbackModel)
-            cost = fallbackResult.costs.total
-          }
-
-          const formattedCost = CostCalculator.formatCost(cost)
-          const accountInfo = accountMap.get(accountId)
-
-          dayData.accounts[accountId] = {
-            name: accountInfo ? accountInfo.name : `账号 ${accountId.slice(0, 8)}`,
-            cost,
-            formattedCost,
-            requests
-          }
-
-          accountCostTotals.set(accountId, (accountCostTotals.get(accountId) || 0) + cost)
-        }
-
-        trendData.push(dayData)
+          accounts: buildAccountBucketStats({
+            usageKeys: usageKeysByDate.get(dayInfo.dateStr) || [],
+            usageDataMap,
+            modelKeysMap: modelKeysByDate,
+            modelDataMap,
+            bucketKey: dayInfo.dateStr,
+            usageKeyRegex: /account_usage:daily:(.+?):\d{4}-\d{2}-\d{2}/,
+            accountIdSet,
+            accountMap,
+            fallbackModel,
+            accountCostTotals
+          })
+        })
       }
     }
 
@@ -2037,410 +1904,92 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
 
     if (granularity === 'hour') {
       // 小时粒度统计
-      let endTime, startTime
-
-      if (startDate && endDate) {
-        startTime = new Date(startDate)
-        endTime = new Date(endDate)
-      } else {
-        endTime = new Date()
-        startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000)
-      }
-
-      // 收集所有小时的元数据和涉及的日期
-      const hourInfos = []
-      const dateSet = new Set()
-      const currentHour = new Date(startTime)
-      currentHour.setMinutes(0, 0, 0)
-
-      while (currentHour <= endTime) {
-        const tzCurrentHour = redis.getDateInTimezone(currentHour)
-        const dateStr = redis.getDateStringInTimezone(currentHour)
-        const hour = String(tzCurrentHour.getUTCHours()).padStart(2, '0')
-        const hourKey = `${dateStr}:${hour}`
-
-        dateSet.add(dateStr)
-
-        const tzDateForLabel = redis.getDateInTimezone(currentHour)
-        const monthLabel = String(tzDateForLabel.getUTCMonth() + 1).padStart(2, '0')
-        const dayLabel = String(tzDateForLabel.getUTCDate()).padStart(2, '0')
-        const hourLabel = String(tzDateForLabel.getUTCHours()).padStart(2, '0')
-
-        hourInfos.push({
-          hourKey,
-          dateStr,
-          isoTime: currentHour.toISOString(),
-          label: `${monthLabel}/${dayLabel} ${hourLabel}:00`
-        })
-
-        currentHour.setHours(currentHour.getHours() + 1)
-      }
+      const { startTime, endTime } = resolveHourRange(startDate, endDate)
+      const hourInfos = buildHourInfos(startTime, endTime)
 
       // 使用索引获取数据，按小时批量查询
-      const _dates = [...dateSet]
-      const usageDataMap = new Map()
-      const modelDataMap = new Map()
-
-      const fetchPromises = hourInfos.map(async (hourInfo) => {
-        const [usageResults, modelResults] = await Promise.all([
-          getUsageDataByIndex(
-            `usage:hourly:index:${hourInfo.hourKey}`,
-            `usage:hourly:{id}:${hourInfo.hourKey}`,
-            `usage:hourly:*:${hourInfo.hourKey}`
-          ),
-          getUsageDataByIndex(
-            `usage:keymodel:hourly:index:${hourInfo.hourKey}`,
-            `usage:{keyId}:model:hourly:{model}:${hourInfo.hourKey}`,
-            `usage:*:model:hourly:*:${hourInfo.hourKey}`
-          )
-        ])
-        return { usageResults, modelResults }
-      })
-
-      const allResults = await Promise.all(fetchPromises)
-      allResults.forEach(({ usageResults, modelResults }) => {
-        usageResults.forEach(({ key, data }) => usageDataMap.set(key, data))
-        modelResults.forEach(({ key, data }) => modelDataMap.set(key, data))
-      })
+      const { usageDataMap, modelDataMap } = await fetchUsageAndModelMaps(hourInfos, (info) => ({
+        usage: [
+          `usage:hourly:index:${info.hourKey}`,
+          `usage:hourly:{id}:${info.hourKey}`,
+          `usage:hourly:*:${info.hourKey}`
+        ],
+        model: [
+          `usage:keymodel:hourly:index:${info.hourKey}`,
+          `usage:{keyId}:model:hourly:{model}:${info.hourKey}`,
+          `usage:*:model:hourly:*:${info.hourKey}`
+        ]
+      }))
 
       // 按 hourKey 分组 keys
-      const usageKeysByHour = new Map()
-      const modelKeysByHour = new Map()
-      for (const key of usageDataMap.keys()) {
-        const match = key.match(/usage:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/)
-        if (match) {
-          const hourKey = match[1]
-          if (!usageKeysByHour.has(hourKey)) {
-            usageKeysByHour.set(hourKey, [])
-          }
-          usageKeysByHour.get(hourKey).push(key)
-        }
-      }
-      for (const key of modelDataMap.keys()) {
-        const match = key.match(/usage:.+?:model:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/)
-        if (match) {
-          const hourKey = match[1]
-          if (!modelKeysByHour.has(hourKey)) {
-            modelKeysByHour.set(hourKey, [])
-          }
-          modelKeysByHour.get(hourKey).push(key)
-        }
-      }
+      const usageKeysByHour = groupKeysByRegex(
+        usageDataMap.keys(),
+        /usage:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/
+      )
+      const modelKeysByHour = groupKeysByRegex(
+        modelDataMap.keys(),
+        /usage:.+?:model:hourly:.+?:(\d{4}-\d{2}-\d{2}:\d{2})/
+      )
 
       // 处理每个小时的数据
       for (const hourInfo of hourInfos) {
-        const hourUsageKeys = usageKeysByHour.get(hourInfo.hourKey) || []
-        const hourModelKeys = modelKeysByHour.get(hourInfo.hourKey) || []
-
-        const hourData = {
+        trendData.push({
           hour: hourInfo.isoTime,
           label: hourInfo.label,
-          apiKeys: {}
-        }
-
-        // 处理 usage 数据
-        const apiKeyDataMap = new Map()
-        for (const key of hourUsageKeys) {
-          const match = key.match(/usage:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/)
-          if (!match) {
-            continue
-          }
-
-          const apiKeyId = match[1]
-          const data = usageDataMap.get(key)
-          if (!data || !apiKeyMap.has(apiKeyId)) {
-            continue
-          }
-
-          const inputTokens = parseInt(data.inputTokens) || 0
-          const outputTokens = parseInt(data.outputTokens) || 0
-          const cacheCreateTokens = parseInt(data.cacheCreateTokens) || 0
-          const cacheReadTokens = parseInt(data.cacheReadTokens) || 0
-
-          apiKeyDataMap.set(apiKeyId, {
-            name: apiKeyMap.get(apiKeyId).name,
-            tokens: inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens,
-            requests: parseInt(data.requests) || 0,
-            inputTokens,
-            outputTokens,
-            cacheCreateTokens,
-            cacheReadTokens,
-            ephemeral5mTokens: parseInt(data.ephemeral5mTokens) || 0,
-            ephemeral1hTokens: parseInt(data.ephemeral1hTokens) || 0
+          apiKeys: buildApiKeyBucketStats({
+            usageKeys: usageKeysByHour.get(hourInfo.hourKey) || [],
+            modelKeys: modelKeysByHour.get(hourInfo.hourKey) || [],
+            usageDataMap,
+            modelDataMap,
+            usageKeyRegex: /usage:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/,
+            modelKeyRegex: /usage:(.+?):model:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/,
+            apiKeyMap
           })
-        }
-
-        // 处理 model 数据计算费用
-        const apiKeyCostMap = new Map()
-        for (const modelKey of hourModelKeys) {
-          const match = modelKey.match(/usage:(.+?):model:hourly:(.+?):\d{4}-\d{2}-\d{2}:\d{2}/)
-          if (!match) {
-            continue
-          }
-
-          const apiKeyId = match[1]
-          const model = match[2]
-          const modelData = modelDataMap.get(modelKey)
-          if (!modelData || !apiKeyDataMap.has(apiKeyId)) {
-            continue
-          }
-
-          // 优先使用已存储的费用
-          const hasStoredCost = 'realCostMicro' in modelData || 'ratedCostMicro' in modelData
-          let modelCost = 0
-
-          if (hasStoredCost) {
-            modelCost = (parseInt(modelData.ratedCostMicro) || 0) / 1000000
-          } else {
-            // Legacy fallback：旧数据没有存储费用，从 token 重算
-            const usage = {
-              input_tokens: parseInt(modelData.inputTokens) || 0,
-              output_tokens: parseInt(modelData.outputTokens) || 0,
-              cache_creation_input_tokens: parseInt(modelData.cacheCreateTokens) || 0,
-              cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
-            }
-
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const eph5m = parseInt(modelData.ephemeral5mTokens) || 0
-            const eph1h = parseInt(modelData.ephemeral1hTokens) || 0
-            if (eph5m > 0 || eph1h > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: eph5m,
-                ephemeral_1h_input_tokens: eph1h
-              }
-            }
-
-            const costResult = CostCalculator.calculateCost(usage, model)
-            modelCost = costResult.costs.total
-          }
-
-          const currentCost = apiKeyCostMap.get(apiKeyId) || 0
-          apiKeyCostMap.set(apiKeyId, currentCost + modelCost)
-        }
-
-        // 组合数据
-        for (const [apiKeyId, data] of apiKeyDataMap) {
-          let cost = apiKeyCostMap.get(apiKeyId) || 0
-          let formattedCost = CostCalculator.formatCost(cost)
-
-          // 降级方案
-          if (cost === 0 && data.tokens > 0) {
-            const usage = {
-              input_tokens: data.inputTokens,
-              output_tokens: data.outputTokens,
-              cache_creation_input_tokens: data.cacheCreateTokens,
-              cache_read_input_tokens: data.cacheReadTokens
-            }
-            if (data.ephemeral5mTokens > 0 || data.ephemeral1hTokens > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: data.ephemeral5mTokens,
-                ephemeral_1h_input_tokens: data.ephemeral1hTokens
-              }
-            }
-            const fallbackResult = CostCalculator.calculateCost(usage, 'claude-3-5-sonnet-20241022')
-            cost = fallbackResult.costs.total
-            formattedCost = fallbackResult.formatted.total
-          }
-
-          hourData.apiKeys[apiKeyId] = {
-            name: data.name,
-            tokens: data.tokens,
-            requests: data.requests,
-            cost,
-            formattedCost
-          }
-        }
-
-        trendData.push(hourData)
+        })
       }
     } else {
       // 天粒度统计（按日期集合扫描）
       const daysCount = parseInt(days) || 7
-      const today = new Date()
-
-      // 收集所有天的元数据
-      const dayInfos = []
-      for (let i = 0; i < daysCount; i++) {
-        const date = new Date(today)
-        date.setDate(date.getDate() - i)
-        const dateStr = redis.getDateStringInTimezone(date)
-        dayInfos.push({ dateStr })
-      }
+      const dayInfos = buildDayInfos(daysCount)
 
       // 使用索引获取数据，按日期批量查询
-      const usageDataMap = new Map()
-      const modelDataMap = new Map()
-
-      const fetchPromises = dayInfos.map(async (dayInfo) => {
-        const [usageResults, modelResults] = await Promise.all([
-          getUsageDataByIndex(
-            `usage:daily:index:${dayInfo.dateStr}`,
-            `usage:daily:{id}:${dayInfo.dateStr}`,
-            `usage:daily:*:${dayInfo.dateStr}`
-          ),
-          getUsageDataByIndex(
-            `usage:keymodel:daily:index:${dayInfo.dateStr}`,
-            `usage:{keyId}:model:daily:{model}:${dayInfo.dateStr}`,
-            `usage:*:model:daily:*:${dayInfo.dateStr}`
-          )
-        ])
-        return { usageResults, modelResults }
-      })
-
-      const allResults = await Promise.all(fetchPromises)
-      allResults.forEach(({ usageResults, modelResults }) => {
-        usageResults.forEach(({ key, data }) => usageDataMap.set(key, data))
-        modelResults.forEach(({ key, data }) => modelDataMap.set(key, data))
-      })
+      const { usageDataMap, modelDataMap } = await fetchUsageAndModelMaps(dayInfos, (info) => ({
+        usage: [
+          `usage:daily:index:${info.dateStr}`,
+          `usage:daily:{id}:${info.dateStr}`,
+          `usage:daily:*:${info.dateStr}`
+        ],
+        model: [
+          `usage:keymodel:daily:index:${info.dateStr}`,
+          `usage:{keyId}:model:daily:{model}:${info.dateStr}`,
+          `usage:*:model:daily:*:${info.dateStr}`
+        ]
+      }))
 
       // 按 dateStr 分组 keys
-      const usageKeysByDate = new Map()
-      const modelKeysByDate = new Map()
-      for (const key of usageDataMap.keys()) {
-        const match = key.match(/usage:daily:.+?:(\d{4}-\d{2}-\d{2})/)
-        if (match) {
-          const dateStr = match[1]
-          if (!usageKeysByDate.has(dateStr)) {
-            usageKeysByDate.set(dateStr, [])
-          }
-          usageKeysByDate.get(dateStr).push(key)
-        }
-      }
-      for (const key of modelDataMap.keys()) {
-        const match = key.match(/usage:.+?:model:daily:.+?:(\d{4}-\d{2}-\d{2})/)
-        if (match) {
-          const dateStr = match[1]
-          if (!modelKeysByDate.has(dateStr)) {
-            modelKeysByDate.set(dateStr, [])
-          }
-          modelKeysByDate.get(dateStr).push(key)
-        }
-      }
+      const usageKeysByDate = groupKeysByRegex(
+        usageDataMap.keys(),
+        /usage:daily:.+?:(\d{4}-\d{2}-\d{2})/
+      )
+      const modelKeysByDate = groupKeysByRegex(
+        modelDataMap.keys(),
+        /usage:.+?:model:daily:.+?:(\d{4}-\d{2}-\d{2})/
+      )
 
       // 处理每天的数据
       for (const dayInfo of dayInfos) {
-        const dayUsageKeys = usageKeysByDate.get(dayInfo.dateStr) || []
-        const dayModelKeys = modelKeysByDate.get(dayInfo.dateStr) || []
-
-        const dayData = {
+        trendData.push({
           date: dayInfo.dateStr,
-          apiKeys: {}
-        }
-
-        // 处理 usage 数据
-        const apiKeyDataMap = new Map()
-        for (const key of dayUsageKeys) {
-          const match = key.match(/usage:daily:(.+?):\d{4}-\d{2}-\d{2}/)
-          if (!match) {
-            continue
-          }
-
-          const apiKeyId = match[1]
-          const data = usageDataMap.get(key)
-          if (!data || !apiKeyMap.has(apiKeyId)) {
-            continue
-          }
-
-          const inputTokens = parseInt(data.inputTokens) || 0
-          const outputTokens = parseInt(data.outputTokens) || 0
-          const cacheCreateTokens = parseInt(data.cacheCreateTokens) || 0
-          const cacheReadTokens = parseInt(data.cacheReadTokens) || 0
-
-          apiKeyDataMap.set(apiKeyId, {
-            name: apiKeyMap.get(apiKeyId).name,
-            tokens: inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens,
-            requests: parseInt(data.requests) || 0,
-            inputTokens,
-            outputTokens,
-            cacheCreateTokens,
-            cacheReadTokens,
-            ephemeral5mTokens: parseInt(data.ephemeral5mTokens) || 0,
-            ephemeral1hTokens: parseInt(data.ephemeral1hTokens) || 0
+          apiKeys: buildApiKeyBucketStats({
+            usageKeys: usageKeysByDate.get(dayInfo.dateStr) || [],
+            modelKeys: modelKeysByDate.get(dayInfo.dateStr) || [],
+            usageDataMap,
+            modelDataMap,
+            usageKeyRegex: /usage:daily:(.+?):\d{4}-\d{2}-\d{2}/,
+            modelKeyRegex: /usage:(.+?):model:daily:(.+?):\d{4}-\d{2}-\d{2}/,
+            apiKeyMap
           })
-        }
-
-        // 处理 model 数据计算费用
-        const apiKeyCostMap = new Map()
-        for (const modelKey of dayModelKeys) {
-          const match = modelKey.match(/usage:(.+?):model:daily:(.+?):\d{4}-\d{2}-\d{2}/)
-          if (!match) {
-            continue
-          }
-
-          const apiKeyId = match[1]
-          const model = match[2]
-          const modelData = modelDataMap.get(modelKey)
-          if (!modelData || !apiKeyDataMap.has(apiKeyId)) {
-            continue
-          }
-
-          // 优先使用已存储的费用
-          const hasStoredCost = 'realCostMicro' in modelData || 'ratedCostMicro' in modelData
-          let modelCost = 0
-
-          if (hasStoredCost) {
-            modelCost = (parseInt(modelData.ratedCostMicro) || 0) / 1000000
-          } else {
-            // Legacy fallback：旧数据没有存储费用，从 token 重算
-            const usage = {
-              input_tokens: parseInt(modelData.inputTokens) || 0,
-              output_tokens: parseInt(modelData.outputTokens) || 0,
-              cache_creation_input_tokens: parseInt(modelData.cacheCreateTokens) || 0,
-              cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
-            }
-
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const eph5m = parseInt(modelData.ephemeral5mTokens) || 0
-            const eph1h = parseInt(modelData.ephemeral1hTokens) || 0
-            if (eph5m > 0 || eph1h > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: eph5m,
-                ephemeral_1h_input_tokens: eph1h
-              }
-            }
-
-            const costResult = CostCalculator.calculateCost(usage, model)
-            modelCost = costResult.costs.total
-          }
-
-          const currentCost = apiKeyCostMap.get(apiKeyId) || 0
-          apiKeyCostMap.set(apiKeyId, currentCost + modelCost)
-        }
-
-        // 组合数据
-        for (const [apiKeyId, data] of apiKeyDataMap) {
-          let cost = apiKeyCostMap.get(apiKeyId) || 0
-          let formattedCost = CostCalculator.formatCost(cost)
-
-          // 降级方案
-          if (cost === 0 && data.tokens > 0) {
-            const usage = {
-              input_tokens: data.inputTokens,
-              output_tokens: data.outputTokens,
-              cache_creation_input_tokens: data.cacheCreateTokens,
-              cache_read_input_tokens: data.cacheReadTokens
-            }
-            if (data.ephemeral5mTokens > 0 || data.ephemeral1hTokens > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: data.ephemeral5mTokens,
-                ephemeral_1h_input_tokens: data.ephemeral1hTokens
-              }
-            }
-            const fallbackResult = CostCalculator.calculateCost(usage, 'claude-3-5-sonnet-20241022')
-            cost = fallbackResult.costs.total
-            formattedCost = fallbackResult.formatted.total
-          }
-
-          dayData.apiKeys[apiKeyId] = {
-            name: data.name,
-            tokens: data.tokens,
-            requests: data.requests,
-            cost,
-            formattedCost
-          }
-        }
-
-        trendData.push(dayData)
+        })
       }
     }
 
@@ -2571,85 +2120,19 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
 
         const rawModel = modelMatch[1]
         const normalizedModel = normalizeModelName(rawModel)
-
-        if (!modelUsageMap.has(normalizedModel)) {
-          modelUsageMap.set(normalizedModel, {
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheCreateTokens: 0,
-            cacheReadTokens: 0,
-            ephemeral5mTokens: 0,
-            ephemeral1hTokens: 0
-          })
-        }
-
-        const modelUsage = modelUsageMap.get(normalizedModel)
-        modelUsage.inputTokens += parseInt(data.inputTokens) || 0
-        modelUsage.outputTokens += parseInt(data.outputTokens) || 0
-        modelUsage.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
-        modelUsage.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
-        modelUsage.ephemeral5mTokens += parseInt(data.ephemeral5mTokens) || 0
-        modelUsage.ephemeral1hTokens += parseInt(data.ephemeral1hTokens) || 0
+        accumulateModelUsage(modelUsageMap, normalizedModel, data)
       }
 
       // 计算7天统计的费用
       logger.info(`💰 Processing ${modelUsageMap.size} unique models for 7days cost calculation`)
-
-      for (const [model, usage] of modelUsageMap) {
-        const usageData = {
-          input_tokens: usage.inputTokens,
-          output_tokens: usage.outputTokens,
-          cache_creation_input_tokens: usage.cacheCreateTokens,
-          cache_read_input_tokens: usage.cacheReadTokens
-        }
-
-        // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-        if (usage.ephemeral5mTokens > 0 || usage.ephemeral1hTokens > 0) {
-          usageData.cache_creation = {
-            ephemeral_5m_input_tokens: usage.ephemeral5mTokens,
-            ephemeral_1h_input_tokens: usage.ephemeral1hTokens
-          }
-        }
-
-        const costResult = CostCalculator.calculateCost(usageData, model)
-        totalCosts.inputCost += costResult.costs.input
-        totalCosts.outputCost += costResult.costs.output
-        totalCosts.cacheCreateCost += costResult.costs.cacheWrite
-        totalCosts.cacheReadCost += costResult.costs.cacheRead
-        totalCosts.totalCost += costResult.costs.total
-
-        logger.info(
-          `💰 Model ${model} (7days): ${
-            usage.inputTokens + usage.outputTokens + usage.cacheCreateTokens + usage.cacheReadTokens
-          } tokens, cost: ${costResult.formatted.total}`
-        )
-
-        // 记录模型费用
-        modelCosts[model] = {
-          model,
-          requests: 0, // 7天汇总数据没有请求数统计
-          usage: usageData,
-          costs: costResult.costs,
-          formatted: costResult.formatted,
-          usingDynamicPricing: costResult.usingDynamicPricing
-        }
-      }
+      summarizeModelUsageCosts(modelUsageMap, totalCosts, modelCosts, ' (7days)')
 
       // 返回7天统计结果
       return res.json({
         success: true,
         data: {
           period,
-          totalCosts: {
-            ...totalCosts,
-            formatted: {
-              inputCost: CostCalculator.formatCost(totalCosts.inputCost),
-              outputCost: CostCalculator.formatCost(totalCosts.outputCost),
-              cacheCreateCost: CostCalculator.formatCost(totalCosts.cacheCreateCost),
-              cacheReadCost: CostCalculator.formatCost(totalCosts.cacheReadCost),
-              totalCost: CostCalculator.formatCost(totalCosts.totalCost)
-            }
-          },
+          totalCosts: formatTotalCosts(totalCosts),
           modelCosts: Object.values(modelCosts)
         }
       })
@@ -2684,72 +2167,12 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
           }
 
           const model = modelMatch[1]
-
-          if (!modelUsageMap.has(model)) {
-            modelUsageMap.set(model, {
-              inputTokens: 0,
-              outputTokens: 0,
-              cacheCreateTokens: 0,
-              cacheReadTokens: 0,
-              ephemeral5mTokens: 0,
-              ephemeral1hTokens: 0
-            })
-          }
-
-          const modelUsage = modelUsageMap.get(model)
-          modelUsage.inputTokens += parseInt(data.inputTokens) || 0
-          modelUsage.outputTokens += parseInt(data.outputTokens) || 0
-          modelUsage.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
-          modelUsage.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
-          modelUsage.ephemeral5mTokens += parseInt(data.ephemeral5mTokens) || 0
-          modelUsage.ephemeral1hTokens += parseInt(data.ephemeral1hTokens) || 0
+          accumulateModelUsage(modelUsageMap, model, data)
         }
 
         // 使用模型级别的数据计算费用
         logger.info(`💰 Processing ${modelUsageMap.size} unique models for total cost calculation`)
-
-        for (const [model, usage] of modelUsageMap) {
-          const usageData = {
-            input_tokens: usage.inputTokens,
-            output_tokens: usage.outputTokens,
-            cache_creation_input_tokens: usage.cacheCreateTokens,
-            cache_read_input_tokens: usage.cacheReadTokens
-          }
-
-          // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-          if (usage.ephemeral5mTokens > 0 || usage.ephemeral1hTokens > 0) {
-            usageData.cache_creation = {
-              ephemeral_5m_input_tokens: usage.ephemeral5mTokens,
-              ephemeral_1h_input_tokens: usage.ephemeral1hTokens
-            }
-          }
-
-          const costResult = CostCalculator.calculateCost(usageData, model)
-          totalCosts.inputCost += costResult.costs.input
-          totalCosts.outputCost += costResult.costs.output
-          totalCosts.cacheCreateCost += costResult.costs.cacheWrite
-          totalCosts.cacheReadCost += costResult.costs.cacheRead
-          totalCosts.totalCost += costResult.costs.total
-
-          logger.info(
-            `💰 Model ${model}: ${
-              usage.inputTokens +
-              usage.outputTokens +
-              usage.cacheCreateTokens +
-              usage.cacheReadTokens
-            } tokens, cost: ${costResult.formatted.total}`
-          )
-
-          // 记录模型费用
-          modelCosts[model] = {
-            model,
-            requests: 0, // 历史汇总数据没有请求数
-            usage: usageData,
-            costs: costResult.costs,
-            formatted: costResult.formatted,
-            usingDynamicPricing: costResult.usingDynamicPricing
-          }
-        }
+        summarizeModelUsageCosts(modelUsageMap, totalCosts, modelCosts)
       } else {
         // 如果没有详细的模型统计数据，回退到API Key汇总数据（延迟加载）
         logger.warn('No detailed model statistics found, falling back to API Key aggregated data')
@@ -2757,30 +2180,12 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
 
         for (const apiKey of apiKeys) {
           if (apiKey.usage && apiKey.usage.total) {
-            const usage = {
-              input_tokens: apiKey.usage.total.inputTokens || 0,
-              output_tokens: apiKey.usage.total.outputTokens || 0,
-              cache_creation_input_tokens: apiKey.usage.total.cacheCreateTokens || 0,
-              cache_read_input_tokens: apiKey.usage.total.cacheReadTokens || 0
-            }
-
-            // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-            const totalEph5m = apiKey.usage.total.ephemeral5mTokens || 0
-            const totalEph1h = apiKey.usage.total.ephemeral1hTokens || 0
-            if (totalEph5m > 0 || totalEph1h > 0) {
-              usage.cache_creation = {
-                ephemeral_5m_input_tokens: totalEph5m,
-                ephemeral_1h_input_tokens: totalEph1h
-              }
-            }
-
             // 使用加权平均价格计算（基于当前活跃模型的价格分布）
-            const costResult = CostCalculator.calculateCost(usage, 'claude-3-5-haiku-20241022')
-            totalCosts.inputCost += costResult.costs.input
-            totalCosts.outputCost += costResult.costs.output
-            totalCosts.cacheCreateCost += costResult.costs.cacheWrite
-            totalCosts.cacheReadCost += costResult.costs.cacheRead
-            totalCosts.totalCost += costResult.costs.total
+            const costResult = CostCalculator.calculateCost(
+              buildBillingUsage(apiKey.usage.total),
+              'claude-3-5-haiku-20241022'
+            )
+            addCostResult(totalCosts, costResult)
           }
         }
       }
@@ -2789,16 +2194,7 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
         success: true,
         data: {
           period,
-          totalCosts: {
-            ...totalCosts,
-            formatted: {
-              inputCost: CostCalculator.formatCost(totalCosts.inputCost),
-              outputCost: CostCalculator.formatCost(totalCosts.outputCost),
-              cacheCreateCost: CostCalculator.formatCost(totalCosts.cacheCreateCost),
-              cacheReadCost: CostCalculator.formatCost(totalCosts.cacheReadCost),
-              totalCost: CostCalculator.formatCost(totalCosts.totalCost)
-            }
-          },
+          totalCosts: formatTotalCosts(totalCosts),
           modelCosts: Object.values(modelCosts).sort((a, b) => b.costs.total - a.costs.total),
           pricingServiceStatus: pricingService.getStatus()
         }
@@ -2839,31 +2235,11 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
       }
 
       const model = match[1]
-      const usage = {
-        input_tokens: parseInt(data.inputTokens) || 0,
-        output_tokens: parseInt(data.outputTokens) || 0,
-        cache_creation_input_tokens: parseInt(data.cacheCreateTokens) || 0,
-        cache_read_input_tokens: parseInt(data.cacheReadTokens) || 0
-      }
-
-      // 如果有 ephemeral 5m/1h 拆分数据，添加 cache_creation 子对象以实现精确计费
-      const eph5m = parseInt(data.ephemeral5mTokens) || 0
-      const eph1h = parseInt(data.ephemeral1hTokens) || 0
-      if (eph5m > 0 || eph1h > 0) {
-        usage.cache_creation = {
-          ephemeral_5m_input_tokens: eph5m,
-          ephemeral_1h_input_tokens: eph1h
-        }
-      }
-
+      const usage = buildBillingUsage(data)
       const costResult = CostCalculator.calculateCost(usage, model)
 
       // 累加总费用
-      totalCosts.inputCost += costResult.costs.input
-      totalCosts.outputCost += costResult.costs.output
-      totalCosts.cacheCreateCost += costResult.costs.cacheWrite
-      totalCosts.cacheReadCost += costResult.costs.cacheRead
-      totalCosts.totalCost += costResult.costs.total
+      addCostResult(totalCosts, costResult)
 
       // 记录模型费用
       modelCosts[model] = {
@@ -2880,16 +2256,7 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
       success: true,
       data: {
         period,
-        totalCosts: {
-          ...totalCosts,
-          formatted: {
-            inputCost: CostCalculator.formatCost(totalCosts.inputCost),
-            outputCost: CostCalculator.formatCost(totalCosts.outputCost),
-            cacheCreateCost: CostCalculator.formatCost(totalCosts.cacheCreateCost),
-            cacheReadCost: CostCalculator.formatCost(totalCosts.cacheReadCost),
-            totalCost: CostCalculator.formatCost(totalCosts.totalCost)
-          }
-        },
+        totalCosts: formatTotalCosts(totalCosts),
         modelCosts: Object.values(modelCosts).sort((a, b) => b.costs.total - a.costs.total),
         pricingServiceStatus: pricingService.getStatus()
       }
@@ -2906,27 +2273,12 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
 router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res) => {
   try {
     const { keyId } = req.params
-    const {
-      page = 1,
-      pageSize = 50,
-      startDate,
-      endDate,
-      model,
-      accountId,
-      sortOrder = 'desc'
-    } = req.query
+    const { model, accountId } = req.query
 
-    const pageNumber = Math.max(parseInt(page, 10) || 1, 1)
-    const pageSizeNumber = Math.min(Math.max(parseInt(pageSize, 10) || 50, 1), 200)
-    const normalizedSortOrder = sortOrder === 'asc' ? 'asc' : 'desc'
+    const { pageNumber, pageSizeNumber, normalizedSortOrder, startTime, endTime, invalidRange } =
+      parseRecordQuery(req.query)
 
-    const startTime = startDate ? new Date(startDate) : null
-    const endTime = endDate ? new Date(endDate) : null
-
-    if (
-      (startDate && Number.isNaN(startTime?.getTime())) ||
-      (endDate && Number.isNaN(endTime?.getTime()))
-    ) {
+    if (invalidRange) {
       return res.status(400).json({ success: false, error: 'Invalid date range' })
     }
 
@@ -2996,47 +2348,8 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
       return null
     }
 
-    const toUsageObject = (record) => {
-      const usage = {
-        input_tokens: record.inputTokens || 0,
-        output_tokens: record.outputTokens || 0,
-        cache_creation_input_tokens: record.cacheCreateTokens || 0,
-        cache_read_input_tokens: record.cacheReadTokens || 0,
-        cache_creation: record.cacheCreation || record.cache_creation || null
-      }
-      // 如果没有 cache_creation 但有独立存储的 ephemeral 字段，构建子对象
-      if (!usage.cache_creation) {
-        const eph5m = parseInt(record.ephemeral5mTokens) || 0
-        const eph1h = parseInt(record.ephemeral1hTokens) || 0
-        if (eph5m > 0 || eph1h > 0) {
-          usage.cache_creation = {
-            ephemeral_5m_input_tokens: eph5m,
-            ephemeral_1h_input_tokens: eph1h
-          }
-        }
-      }
-      return usage
-    }
-
-    const withinRange = (record) => {
-      if (!record.timestamp) {
-        return false
-      }
-      const ts = new Date(record.timestamp)
-      if (Number.isNaN(ts.getTime())) {
-        return false
-      }
-      if (startTime && ts < startTime) {
-        return false
-      }
-      if (endTime && ts > endTime) {
-        return false
-      }
-      return true
-    }
-
     const filteredRecords = rawRecords.filter((record) => {
-      if (!withinRange(record)) {
+      if (!isRecordWithinRange(record, startTime, endTime)) {
         return false
       }
       if (model && record.model !== model) {
@@ -3048,14 +2361,7 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
       return true
     })
 
-    filteredRecords.sort((a, b) => {
-      const aTime = new Date(a.timestamp).getTime()
-      const bTime = new Date(b.timestamp).getTime()
-      if (Number.isNaN(aTime) || Number.isNaN(bTime)) {
-        return 0
-      }
-      return normalizedSortOrder === 'asc' ? aTime - bTime : bTime - aTime
-    })
+    sortRecordsByTimestamp(filteredRecords, normalizedSortOrder)
 
     const summary = {
       totalRequests: 0,
@@ -3073,25 +2379,8 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
     let latestTimestamp = null
 
     for (const record of filteredRecords) {
-      const usage = toUsageObject(record)
-      const costModel = record.actualModel || record.model || 'unknown'
-      const costData = CostCalculator.calculateCost(usage, costModel)
-      const computedCost =
-        typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
-      const totalTokens =
-        record.totalTokens ||
-        usage.input_tokens +
-          usage.output_tokens +
-          usage.cache_creation_input_tokens +
-          usage.cache_read_input_tokens
-
-      summary.totalRequests += 1
-      summary.inputTokens += usage.input_tokens
-      summary.outputTokens += usage.output_tokens
-      summary.cacheCreateTokens += usage.cache_creation_input_tokens
-      summary.cacheReadTokens += usage.cache_read_input_tokens
-      summary.totalTokens += totalTokens
-      summary.totalCost += computedCost
+      const { usage, totalTokens, computedCost } = computeRecordCost(record)
+      addRecordToSummary(summary, usage, totalTokens, computedCost)
 
       if (record.model) {
         modelSet.add(record.model)
@@ -3122,28 +2411,11 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
       }
     }
 
-    const totalRecords = filteredRecords.length
-    const totalPages = totalRecords > 0 ? Math.ceil(totalRecords / pageSizeNumber) : 0
-    const safePage = totalPages > 0 ? Math.min(pageNumber, totalPages) : 1
-    const startIndex = (safePage - 1) * pageSizeNumber
-    const pageRecords =
-      totalRecords === 0 ? [] : filteredRecords.slice(startIndex, startIndex + pageSizeNumber)
+    const { pageRecords, pagination } = paginateRecords(filteredRecords, pageNumber, pageSizeNumber)
 
     const enrichedRecords = []
     for (const record of pageRecords) {
-      const usage = toUsageObject(record)
-      const costModel = record.actualModel || record.model || 'unknown'
-      const costData = CostCalculator.calculateCost(usage, costModel)
-      const computedCost =
-        typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
-      const realCost =
-        typeof record.realCost === 'number' ? record.realCost : costData?.costs?.total || 0
-      const totalTokens =
-        record.totalTokens ||
-        usage.input_tokens +
-          usage.output_tokens +
-          usage.cache_creation_input_tokens +
-          usage.cache_read_input_tokens
+      const { usage, costData, computedCost, realCost, totalTokens } = computeRecordCost(record)
 
       const accountInfo = await resolveAccountInfo(record.accountId, record.accountType)
       const resolvedAccountType = accountInfo?.type || record.accountType || 'unknown'
@@ -3171,14 +2443,7 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
         costFormatted: CostCalculator.formatCost(computedCost),
         realCost: Number(realCost.toFixed(6)),
         realCostFormatted: CostCalculator.formatCost(realCost),
-        costBreakdown: record.realCostBreakdown ||
-          record.costBreakdown || {
-            input: costData?.costs?.input || 0,
-            output: costData?.costs?.output || 0,
-            cacheCreate: costData?.costs?.cacheWrite || 0,
-            cacheRead: costData?.costs?.cacheRead || 0,
-            total: costData?.costs?.total || computedCost
-          },
+        costBreakdown: buildCostBreakdown(record, costData, computedCost),
         responseTime: record.responseTime || null
       })
     }
@@ -3219,14 +2484,7 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
       success: true,
       data: {
         records: enrichedRecords,
-        pagination: {
-          currentPage: safePage,
-          pageSize: pageSizeNumber,
-          totalRecords,
-          totalPages,
-          hasNextPage: totalPages > 0 && safePage < totalPages,
-          hasPreviousPage: totalPages > 0 && safePage > 1
-        },
+        pagination,
         filters: {
           startDate: startTime ? startTime.toISOString() : null,
           endDate: endTime ? endTime.toISOString() : null,
@@ -3238,14 +2496,7 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
           id: keyId,
           name: apiKeyInfo.name || apiKeyInfo.label || keyId
         },
-        summary: {
-          ...summary,
-          totalCost: Number(summary.totalCost.toFixed(6)),
-          avgCost:
-            summary.totalRequests > 0
-              ? Number((summary.totalCost / summary.totalRequests).toFixed(6))
-              : 0
-        },
+        summary: finalizeRecordSummary(summary),
         availableFilters: {
           models: Array.from(modelSet),
           accounts: accountOptions,
@@ -3268,28 +2519,12 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
 router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, res) => {
   try {
     const { accountId } = req.params
-    const {
-      platform,
-      page = 1,
-      pageSize = 50,
-      startDate,
-      endDate,
-      model,
-      apiKeyId,
-      sortOrder = 'desc'
-    } = req.query
+    const { platform, model, apiKeyId } = req.query
 
-    const pageNumber = Math.max(parseInt(page, 10) || 1, 1)
-    const pageSizeNumber = Math.min(Math.max(parseInt(pageSize, 10) || 50, 1), 200)
-    const normalizedSortOrder = sortOrder === 'asc' ? 'asc' : 'desc'
+    const { pageNumber, pageSizeNumber, normalizedSortOrder, startTime, endTime, invalidRange } =
+      parseRecordQuery(req.query)
 
-    const startTime = startDate ? new Date(startDate) : null
-    const endTime = endDate ? new Date(endDate) : null
-
-    if (
-      (startDate && Number.isNaN(startTime?.getTime())) ||
-      (endDate && Number.isNaN(endTime?.getTime()))
-    ) {
+    if (invalidRange) {
       return res.status(400).json({ success: false, error: 'Invalid date range' })
     }
 
@@ -3312,45 +2547,6 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
     let keysToUse = apiKeyId ? allApiKeys.filter((key) => key.id === apiKeyId) : allApiKeys
     if (apiKeyId && keysToUse.length === 0) {
       keysToUse = [{ id: apiKeyId }]
-    }
-
-    const toUsageObject = (record) => {
-      const usage = {
-        input_tokens: record.inputTokens || 0,
-        output_tokens: record.outputTokens || 0,
-        cache_creation_input_tokens: record.cacheCreateTokens || 0,
-        cache_read_input_tokens: record.cacheReadTokens || 0,
-        cache_creation: record.cacheCreation || record.cache_creation || null
-      }
-      // 如果没有 cache_creation 但有独立存储的 ephemeral 字段，构建子对象
-      if (!usage.cache_creation) {
-        const eph5m = parseInt(record.ephemeral5mTokens) || 0
-        const eph1h = parseInt(record.ephemeral1hTokens) || 0
-        if (eph5m > 0 || eph1h > 0) {
-          usage.cache_creation = {
-            ephemeral_5m_input_tokens: eph5m,
-            ephemeral_1h_input_tokens: eph1h
-          }
-        }
-      }
-      return usage
-    }
-
-    const withinRange = (record) => {
-      if (!record.timestamp) {
-        return false
-      }
-      const ts = new Date(record.timestamp)
-      if (Number.isNaN(ts.getTime())) {
-        return false
-      }
-      if (startTime && ts < startTime) {
-        return false
-      }
-      if (endTime && ts > endTime) {
-        return false
-      }
-      return true
     }
 
     const missingUsageStatuses = new Set([
@@ -3399,7 +2595,7 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
           if (record.accountId !== accountId) {
             continue
           }
-          if (!withinRange(record)) {
+          if (!isRecordWithinRange(record, startTime, endTime)) {
             continue
           }
           if (model && record.model !== model) {
@@ -3435,14 +2631,7 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
       }
     }
 
-    filteredRecords.sort((a, b) => {
-      const aTime = new Date(a.timestamp).getTime()
-      const bTime = new Date(b.timestamp).getTime()
-      if (Number.isNaN(aTime) || Number.isNaN(bTime)) {
-        return 0
-      }
-      return normalizedSortOrder === 'asc' ? aTime - bTime : bTime - aTime
-    })
+    sortRecordsByTimestamp(filteredRecords, normalizedSortOrder)
 
     const summary = {
       totalRequests: 0,
@@ -3459,25 +2648,8 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
     }
 
     for (const record of filteredRecords) {
-      const usage = toUsageObject(record)
-      const costModel = record.actualModel || record.model || 'unknown'
-      const costData = CostCalculator.calculateCost(usage, costModel)
-      const computedCost =
-        typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
-      const totalTokens =
-        record.totalTokens ||
-        usage.input_tokens +
-          usage.output_tokens +
-          usage.cache_creation_input_tokens +
-          usage.cache_read_input_tokens
-
-      summary.totalRequests += 1
-      summary.inputTokens += usage.input_tokens
-      summary.outputTokens += usage.output_tokens
-      summary.cacheCreateTokens += usage.cache_creation_input_tokens
-      summary.cacheReadTokens += usage.cache_read_input_tokens
-      summary.totalTokens += totalTokens
-      summary.totalCost += computedCost
+      const { usage, totalTokens, computedCost } = computeRecordCost(record)
+      addRecordToSummary(summary, usage, totalTokens, computedCost)
 
       const usageStatus = getUsageStatus(record)
       if (usageStatus === 'completed') {
@@ -3494,30 +2666,13 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
       }
     }
 
-    const totalRecords = filteredRecords.length
-    const totalPages = totalRecords > 0 ? Math.ceil(totalRecords / pageSizeNumber) : 0
-    const safePage = totalPages > 0 ? Math.min(pageNumber, totalPages) : 1
-    const startIndex = (safePage - 1) * pageSizeNumber
-    const pageRecords =
-      totalRecords === 0 ? [] : filteredRecords.slice(startIndex, startIndex + pageSizeNumber)
+    const { pageRecords, pagination } = paginateRecords(filteredRecords, pageNumber, pageSizeNumber)
 
     const enrichedRecords = []
     for (const record of pageRecords) {
-      const usage = toUsageObject(record)
-      const costModel = record.actualModel || record.model || 'unknown'
-      const costData = CostCalculator.calculateCost(usage, costModel)
-      const computedCost =
-        typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
-      const realCost =
-        typeof record.realCost === 'number' ? record.realCost : costData?.costs?.total || 0
+      const { usage, costData, computedCost, realCost, totalTokens } = computeRecordCost(record)
       const usageStatus = getUsageStatus(record)
       const usageMissing = isUsageMissingRecord(record)
-      const totalTokens =
-        record.totalTokens ||
-        usage.input_tokens +
-          usage.output_tokens +
-          usage.cache_creation_input_tokens +
-          usage.cache_read_input_tokens
 
       enrichedRecords.push({
         timestamp: record.timestamp,
@@ -3552,14 +2707,7 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
         costFormatted: CostCalculator.formatCost(computedCost),
         realCost: Number(realCost.toFixed(6)),
         realCostFormatted: CostCalculator.formatCost(realCost),
-        costBreakdown: record.realCostBreakdown ||
-          record.costBreakdown || {
-            input: costData?.costs?.input || 0,
-            output: costData?.costs?.output || 0,
-            cacheCreate: costData?.costs?.cacheWrite || 0,
-            cacheRead: costData?.costs?.cacheRead || 0,
-            total: costData?.costs?.total || computedCost
-          },
+        costBreakdown: buildCostBreakdown(record, costData, computedCost),
         responseTime: record.responseTime || null
       })
     }
@@ -3568,14 +2716,7 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
       success: true,
       data: {
         records: enrichedRecords,
-        pagination: {
-          currentPage: safePage,
-          pageSize: pageSizeNumber,
-          totalRecords,
-          totalPages,
-          hasNextPage: totalPages > 0 && safePage < totalPages,
-          hasPreviousPage: totalPages > 0 && safePage > 1
-        },
+        pagination,
         filters: {
           startDate: startTime ? startTime.toISOString() : null,
           endDate: endTime ? endTime.toISOString() : null,
@@ -3590,14 +2731,7 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
           platform: accountInfo.platform || platform || 'unknown',
           status: accountInfo.status ?? accountInfo.isActive ?? null
         },
-        summary: {
-          ...summary,
-          totalCost: Number(summary.totalCost.toFixed(6)),
-          avgCost:
-            summary.totalRequests > 0
-              ? Number((summary.totalCost / summary.totalRequests).toFixed(6))
-              : 0
-        },
+        summary: finalizeRecordSummary(summary),
         availableFilters: {
           models: Array.from(modelSet),
           apiKeys: Array.from(apiKeyOptionMap.values()),

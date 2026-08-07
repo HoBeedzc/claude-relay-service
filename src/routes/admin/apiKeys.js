@@ -439,41 +439,19 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
 })
 
 /**
- * 使用预计算索引进行费用排序的分页查询
+ * 对排序后的 keyId 列表应用筛选、标签收集与分页（费用排序共用流程）
  */
-async function getApiKeysSortedByCostPrecomputed(options) {
-  const {
-    page,
-    pageSize,
-    sortOrder,
-    costTimeRange,
-    search,
-    searchMode,
-    tag,
-    isActive,
-    modelFilter = []
-  } = options
-  const costRankService = require('../../services/costRankService')
+async function buildRankedApiKeysResult(rankedKeyIds, options, attachCosts) {
+  const { page, pageSize, search, searchMode, tag, isActive, modelFilter = [] } = options
 
-  // 1. 获取排序后的全量 keyId 列表
-  const rankedKeyIds = await costRankService.getSortedKeyIds(costTimeRange, sortOrder)
-
-  if (rankedKeyIds.length === 0) {
-    return {
-      items: [],
-      pagination: { page: 1, pageSize, total: 0, totalPages: 1 },
-      availableTags: []
-    }
-  }
-
-  // 2. 批量获取 API Key 基础数据
+  // 批量获取 API Key 基础数据
   const allKeys = await redis.batchGetApiKeys(rankedKeyIds)
 
-  // 3. 保持排序顺序（使用 Map 优化查找）
+  // 保持排序顺序（使用 Map 优化查找）
   const keyMap = new Map(allKeys.map((k) => [k.id, k]))
   let orderedKeys = rankedKeyIds.map((id) => keyMap.get(id)).filter((k) => k && !k.isDeleted)
 
-  // 4. 应用筛选条件
+  // 应用筛选条件
   // 状态筛选
   if (isActive !== '' && isActive !== undefined && isActive !== null) {
     const activeValue = isActive === 'true' || isActive === true
@@ -508,7 +486,7 @@ async function getApiKeysSortedByCostPrecomputed(options) {
     orderedKeys = orderedKeys.filter((k) => keyIdsWithModels.has(k.id))
   }
 
-  // 5. 收集所有可用标签
+  // 收集所有可用标签
   const allTags = new Set()
   for (const key of allKeys) {
     if (!key.isDeleted) {
@@ -518,21 +496,15 @@ async function getApiKeysSortedByCostPrecomputed(options) {
   }
   const availableTags = [...allTags].sort()
 
-  // 6. 分页
+  // 分页
   const total = orderedKeys.length
   const totalPages = Math.ceil(total / pageSize) || 1
   const validPage = Math.min(Math.max(1, page), totalPages)
   const start = (validPage - 1) * pageSize
   const items = orderedKeys.slice(start, start + pageSize)
 
-  // 7. 为当前页的 Keys 附加费用数据
-  const keyCosts = await costRankService.getBatchKeyCosts(
-    costTimeRange,
-    items.map((k) => k.id)
-  )
-  for (const key of items) {
-    key._cost = keyCosts.get(key.id) || 0
-  }
+  // 为当前页的 Keys 附加费用数据
+  await attachCosts(items)
 
   return {
     items,
@@ -547,21 +519,40 @@ async function getApiKeysSortedByCostPrecomputed(options) {
 }
 
 /**
+ * 使用预计算索引进行费用排序的分页查询
+ */
+async function getApiKeysSortedByCostPrecomputed(options) {
+  const { pageSize, sortOrder, costTimeRange } = options
+  const costRankService = require('../../services/costRankService')
+
+  // 1. 获取排序后的全量 keyId 列表
+  const rankedKeyIds = await costRankService.getSortedKeyIds(costTimeRange, sortOrder)
+
+  if (rankedKeyIds.length === 0) {
+    return {
+      items: [],
+      pagination: { page: 1, pageSize, total: 0, totalPages: 1 },
+      availableTags: []
+    }
+  }
+
+  // 2. 筛选、分页并附加费用数据
+  return buildRankedApiKeysResult(rankedKeyIds, options, async (items) => {
+    const keyCosts = await costRankService.getBatchKeyCosts(
+      costTimeRange,
+      items.map((k) => k.id)
+    )
+    for (const key of items) {
+      key._cost = keyCosts.get(key.id) || 0
+    }
+  })
+}
+
+/**
  * 使用实时计算进行 custom 时间范围的费用排序
  */
 async function getApiKeysSortedByCostCustom(options) {
-  const {
-    page,
-    pageSize,
-    sortOrder,
-    startDate,
-    endDate,
-    search,
-    searchMode,
-    tag,
-    isActive,
-    modelFilter = []
-  } = options
+  const { pageSize, sortOrder, startDate, endDate } = options
   const costRankService = require('../../services/costRankService')
 
   // 1. 实时计算所有 Keys 的费用
@@ -581,80 +572,75 @@ async function getApiKeysSortedByCostCustom(options) {
   )
   const rankedKeyIds = sortedEntries.map(([keyId]) => keyId)
 
-  // 3. 批量获取 API Key 基础数据
-  const allKeys = await redis.batchGetApiKeys(rankedKeyIds)
+  // 3. 筛选、分页并附加费用数据
+  return buildRankedApiKeysResult(rankedKeyIds, options, (items) => {
+    for (const key of items) {
+      key._cost = costs.get(key.id) || 0
+    }
+  })
+}
 
-  // 4. 保持排序顺序
-  const keyMap = new Map(allKeys.map((k) => [k.id, k]))
-  let orderedKeys = rankedKeyIds.map((id) => keyMap.get(id)).filter((k) => k && !k.isDeleted)
-
-  // 5. 应用筛选条件
-  // 状态筛选
-  if (isActive !== '' && isActive !== undefined && isActive !== null) {
-    const activeValue = isActive === 'true' || isActive === true
-    orderedKeys = orderedKeys.filter((k) => k.isActive === activeValue)
-  }
-
-  // 标签筛选
-  if (tag) {
-    orderedKeys = orderedKeys.filter((k) => {
-      const tags = Array.isArray(k.tags) ? k.tags : []
-      return tags.includes(tag)
+/**
+ * 校验批量接口的 keyIds 参数，不合法时直接写入 400 响应并返回 false
+ */
+function validateBatchKeyIds(res, keyIds) {
+  if (!Array.isArray(keyIds) || keyIds.length === 0) {
+    res.status(400).json({
+      success: false,
+      error: 'keyIds is required and must be a non-empty array'
     })
+    return false
   }
 
-  // 搜索筛选
-  if (search) {
-    const lowerSearch = search.toLowerCase().trim()
-    if (searchMode === 'apiKey') {
-      orderedKeys = orderedKeys.filter((k) => k.name && k.name.toLowerCase().includes(lowerSearch))
-    } else if (searchMode === 'bindingAccount') {
-      const accountNameCacheService = require('../../services/accountNameCacheService')
-      orderedKeys = accountNameCacheService.searchByBindingAccount(orderedKeys, lowerSearch)
-    }
+  // 限制单次最多处理 100 个 Key
+  if (keyIds.length > 100) {
+    res.status(400).json({
+      success: false,
+      error: 'Max 100 keys per request'
+    })
+    return false
   }
 
-  // 模型筛选
-  if (modelFilter.length > 0) {
-    const keyIdsWithModels = await redis.getKeyIdsWithModels(
-      orderedKeys.map((k) => k.id),
-      modelFilter
-    )
-    orderedKeys = orderedKeys.filter((k) => keyIdsWithModels.has(k.id))
-  }
+  return true
+}
 
-  // 6. 收集所有可用标签
-  const allTags = new Set()
-  for (const key of allKeys) {
-    if (!key.isDeleted) {
-      const tags = Array.isArray(key.tags) ? key.tags : []
-      tags.forEach((t) => allTags.add(t))
-    }
-  }
-  const availableTags = [...allTags].sort()
+// 创建 API Key 时直接透传的请求字段（单个创建/批量创建共用）
+const API_KEY_CREATE_FIELDS = [
+  'description',
+  'tokenLimit',
+  'expiresAt',
+  'claudeAccountId',
+  'claudeConsoleAccountId',
+  'geminiAccountId',
+  'openaiAccountId',
+  'bedrockAccountId',
+  'droidAccountId',
+  'permissions',
+  'concurrencyLimit',
+  'rateLimitWindow',
+  'rateLimitRequests',
+  'rateLimitCost',
+  'enableModelRestriction',
+  'restrictedModels',
+  'enableClientRestriction',
+  'allowedClients',
+  'dailyCostLimit',
+  'totalCostLimit',
+  'weeklyOpusCostLimit',
+  'tags',
+  'activationDays',
+  'activationUnit',
+  'expirationMode',
+  'icon',
+  'serviceRates'
+]
 
-  // 7. 分页
-  const total = orderedKeys.length
-  const totalPages = Math.ceil(total / pageSize) || 1
-  const validPage = Math.min(Math.max(1, page), totalPages)
-  const start = (validPage - 1) * pageSize
-  const items = orderedKeys.slice(start, start + pageSize)
-
-  // 8. 为当前页的 Keys 附加费用数据
-  for (const key of items) {
-    key._cost = costs.get(key.id) || 0
+function pickApiKeyPayload(body) {
+  const payload = {}
+  for (const field of API_KEY_CREATE_FIELDS) {
+    payload[field] = body[field]
   }
-
-  return {
-    items,
-    pagination: {
-      page: validPage,
-      pageSize,
-      total,
-      totalPages
-    },
-    availableTags
-  }
+  return payload
 }
 
 // 获取费用排序索引状态
@@ -994,19 +980,8 @@ router.post('/api-keys/batch-stats', authenticateAdmin, async (req, res) => {
     } = req.body
 
     // 参数验证
-    if (!Array.isArray(keyIds) || keyIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'keyIds is required and must be a non-empty array'
-      })
-    }
-
-    // 限制单次最多处理 100 个 Key
-    if (keyIds.length > 100) {
-      return res.status(400).json({
-        success: false,
-        error: 'Max 100 keys per request'
-      })
+    if (!validateBatchKeyIds(res, keyIds)) {
+      return undefined
     }
 
     // 验证 custom 时间范围的参数
@@ -1413,19 +1388,8 @@ router.post('/api-keys/batch-last-usage', authenticateAdmin, async (req, res) =>
     const { keyIds } = req.body
 
     // 参数验证
-    if (!Array.isArray(keyIds) || keyIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'keyIds is required and must be a non-empty array'
-      })
-    }
-
-    // 限制单次最多处理 100 个 Key
-    if (keyIds.length > 100) {
-      return res.status(400).json({
-        success: false,
-        error: 'Max 100 keys per request'
-      })
+    if (!validateBatchKeyIds(res, keyIds)) {
+      return undefined
     }
 
     logger.debug(`📊 Batch last-usage request: ${keyIds.length} keys`)
@@ -1504,29 +1468,19 @@ router.post('/api-keys', authenticateAdmin, async (req, res) => {
       description,
       tokenLimit,
       expiresAt,
-      claudeAccountId,
-      claudeConsoleAccountId,
-      geminiAccountId,
-      openaiAccountId,
-      bedrockAccountId,
-      droidAccountId,
       permissions,
       concurrencyLimit,
       rateLimitWindow,
       rateLimitRequests,
-      rateLimitCost,
       enableModelRestriction,
       restrictedModels,
       enableClientRestriction,
       allowedClients,
-      dailyCostLimit,
       totalCostLimit,
-      weeklyOpusCostLimit,
       tags,
       activationDays, // 新增：激活后有效天数
       activationUnit, // 新增：激活时间单位 (hours/days)
       expirationMode, // 新增：过期模式
-      icon, // 新增：图标
       serviceRates, // API Key 级别服务倍率
       weeklyResetDay, // 周费用重置日 (1-7)
       weeklyResetHour, // 周费用重置时 (0-23)
@@ -1706,33 +1660,7 @@ router.post('/api-keys', authenticateAdmin, async (req, res) => {
 
     const newKey = await apiKeyService.generateApiKey({
       name,
-      description,
-      tokenLimit,
-      expiresAt,
-      claudeAccountId,
-      claudeConsoleAccountId,
-      geminiAccountId,
-      openaiAccountId,
-      bedrockAccountId,
-      droidAccountId,
-      permissions,
-      concurrencyLimit,
-      rateLimitWindow,
-      rateLimitRequests,
-      rateLimitCost,
-      enableModelRestriction,
-      restrictedModels,
-      enableClientRestriction,
-      allowedClients,
-      dailyCostLimit,
-      totalCostLimit,
-      weeklyOpusCostLimit,
-      tags,
-      activationDays,
-      activationUnit,
-      expirationMode,
-      icon,
-      serviceRates,
+      ...pickApiKeyPayload(req.body),
       weeklyResetDay:
         weeklyResetDay !== undefined && weeklyResetDay !== null && weeklyResetDay !== ''
           ? Number(weeklyResetDay)
@@ -1761,37 +1689,7 @@ router.post('/api-keys', authenticateAdmin, async (req, res) => {
 // 批量创建API Keys
 router.post('/api-keys/batch', authenticateAdmin, async (req, res) => {
   try {
-    const {
-      baseName,
-      count,
-      description,
-      tokenLimit,
-      expiresAt,
-      claudeAccountId,
-      claudeConsoleAccountId,
-      geminiAccountId,
-      openaiAccountId,
-      bedrockAccountId,
-      droidAccountId,
-      permissions,
-      concurrencyLimit,
-      rateLimitWindow,
-      rateLimitRequests,
-      rateLimitCost,
-      enableModelRestriction,
-      restrictedModels,
-      enableClientRestriction,
-      allowedClients,
-      dailyCostLimit,
-      totalCostLimit,
-      weeklyOpusCostLimit,
-      tags,
-      activationDays,
-      activationUnit,
-      expirationMode,
-      icon,
-      serviceRates
-    } = req.body
+    const { baseName, count, permissions, serviceRates } = req.body
 
     // 输入验证
     if (!baseName || typeof baseName !== 'string' || baseName.trim().length === 0) {
@@ -1829,33 +1727,7 @@ router.post('/api-keys/batch', authenticateAdmin, async (req, res) => {
         const name = `${baseName}_${i}`
         const newKey = await apiKeyService.generateApiKey({
           name,
-          description,
-          tokenLimit,
-          expiresAt,
-          claudeAccountId,
-          claudeConsoleAccountId,
-          geminiAccountId,
-          openaiAccountId,
-          bedrockAccountId,
-          droidAccountId,
-          permissions,
-          concurrencyLimit,
-          rateLimitWindow,
-          rateLimitRequests,
-          rateLimitCost,
-          enableModelRestriction,
-          restrictedModels,
-          enableClientRestriction,
-          allowedClients,
-          dailyCostLimit,
-          totalCostLimit,
-          weeklyOpusCostLimit,
-          tags,
-          activationDays,
-          activationUnit,
-          expirationMode,
-          icon,
-          serviceRates
+          ...pickApiKeyPayload(req.body)
         })
 
         // 保留原始 API Key 供返回
@@ -2536,7 +2408,9 @@ router.patch('/api-keys/:keyId/activation', authenticateAdmin, async (req, res) 
     })
   } catch (error) {
     logger.error('❌ Failed to update API key activation:', error)
-    return res.status(500).json({ error: 'Failed to update API key activation', message: error.message })
+    return res
+      .status(500)
+      .json({ error: 'Failed to update API key activation', message: error.message })
   }
 })
 
